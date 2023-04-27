@@ -11,6 +11,30 @@ def create_model(inp, o, config, embedding,
                  l1=0, l2=0,
                  cont_dtype=tf.float32, 
                  ord_dtype=tf.float32):
+    """
+    Create neural netwroks model
+    Parameters
+    ----------
+        inp: integer or dictionary
+            If integer, all the inputs are continuous values, else
+                if the first element is 'cont': ('cont', size of continuous inputs),
+                if the first element is 'ord': ('ord', size of ordinal inputs),
+                if the first element is 'emb': ('emb', input dimension, output dimension, size of input, l1 regularization, l2 regularization)
+        o: integer
+            the size of output
+        config: list
+            The configuration of layers.
+            dict format: {'unit': unit size, 
+                        'l1': l1 regularization, 
+                        'l2': l2 regularization,
+                        'batch_norm': batch normalization: True or False, 
+                        'dropout': drop-out rate}
+        l1: float
+            L1 regularization of the last layer.
+        l2: float
+            L2 regularization of the last layer.
+        
+    """
     if type(inp) == dict:
         X_inp = {}
         X_cat = []
@@ -73,6 +97,30 @@ def create_model(inp, o, config, embedding,
     return tf.keras.Model(inputs=X_inp, outputs=X)
 
 def create_dataset(X, y=None, ordinal=None, embedding=None, batch_size=512, shuffle_size=102400):
+    """
+        Create a Tensorflow dataset and the input layers from DataFrame
+        Parameters
+        ----------
+            X: DataFrame
+                input dataframe or numpy array
+            y: DataFrame or Series
+                If y is dataframe and two more columns, the learning task should be regression or binary classfication
+            ordinal: list or integer
+                If ordinal is list, X should be DataFrame. In this case, the ordinal is the column names of ordinal inputs.
+                If ordinal is the number, ordinal is the size of ordinal inputs.
+            embedding: list
+                If X is DataFrame, the list is consisted of (list of columns, input dimension, output dimension, l1 regularization, l2 regularization) tuples
+                If X is DataFrame, the list is consisted of (the size of input, input dimension, output dimension, l1 regularization, l2 regularization) tuples
+            batch_size: integer
+                The size of the batch of the dataset.
+            shuffle_size: integer
+                The shuffle buffer size
+        Returns
+        -------
+            tf.data.Dataset, (list, tf.data.Dataset)
+                a tensorflow dataset, (the configuration of input layers, output dataset)
+                
+    """
     output_ = None
     if ordinal is not None or embedding is not None:
         inp, arr = {}, {}
@@ -101,7 +149,7 @@ def create_dataset(X, y=None, ordinal=None, embedding=None, batch_size=512, shuf
                 arr['X_ord'] = X[:, cont_len: (cont_len + ordinal)]
             if embedding is not None:
                 f_ = cont_len + ordinal
-                for k,v in enumerate(embedding):
+                for k, v in enumerate(embedding):
                     inp['X_emb_{}'.format(k)] = ('emb', v[1], v[2], v[0], v[3], v[4])
                     arr['X_emb_{}'.format(k)] = X[:, f_:f_+v[0]]
                     f_ += v[0]
@@ -142,7 +190,82 @@ class NNEstimator(BaseEstimator):
             Neural Network Estimator with tensorflow
             Parameters:
                 network_config: list
-                    neural network configuration 
+                    The configuration of layers.
+                    dict format: {'unit': unit size, 
+                                'l1': l1 regularization, 
+                                'l2': l2 regularization,
+                                'batch_norm': batch normalization: True or False, 
+                                'dropout': drop-out rate}
+                ordinal: list or integer
+                    If ordinal is list, X should be DataFrame. In this case, the ordinal is the column names of ordinal inputs.
+                    If ordinal is the number, ordinal is the size of ordinal inputs.
+                embedding: list
+                    If embedding is list, X should be DataFrame. In this case, the ordinal is the column names of embedding inputs.
+                    If embedding is the number, embedding is the size of embedding inputs.
+                batch_size: integer
+                    The size of the batch of the dataset.
+                shuffle_size: integer
+                    The shuffle buffer size.
+                learning_rate: float
+                    The learning rate of the optimizer
+                l1: float
+                    L1 regularization of the last layer.
+                l2: float
+                    L2 regularization of the last layer.
+                early_stopping: dict
+                    The parameters of tf.keras.callbacks.EarlyStopping
+                        monitor='val_loss',
+                        min_delta=0,
+                        patience=0,
+                        mode='auto',
+                        baseline=None,
+                        restore_best_weights=False,
+                        start_from_epoch=0
+                reduce_lr_on_plateau: dict
+                    The parameters of tf.keras.callback.ReduceLROnPlateau
+                        monitor='val_loss',
+                        factor=0.1,
+                        patience=10,
+                        mode='auto',
+                        min_delta=0.0001,
+                        cooldown=0,
+                        min_lr=0,
+                lr_scheduler: dict
+                    The parameters of tf.keras.callback.LearningRateScheduler
+                        schedule
+
+               Examples
+               --------
+               >>> def create_nn_model():
+               >>>     ct = ColumnTransformer([
+               >>>         ('std', StandardScaler(), X_cont +  ['f_28_diff', 'f_max', 'f_max2', 'f_min', 'f_min2', 'f_mm_diff', 'f_02_21', 'f_05_22'] + X_int[:-1]),
+               >>>         ('ord', make_pipeline(OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=24), StandardScaler()), df_f_27.columns.tolist()), 
+               >>>         ('ord2', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=9), ['f_idx_min_1', 'f_idx_max_1', 'f_idx_min_2', 'f_idx_max_2']),
+               >>>         ('ord3', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=13), ['f_idx_min_3', 'f_idx_max_3']),
+               >>>         ('pt2', 'passthrough', X_int[-1:])
+               >>>     ])
+               >>>     nn = sgnn.NNClassifier(
+               >>>         [
+               >>>             {'unit': 64, 'activation': 'swish', 'batch_norm': True, 'l2': 1e-5},
+               >>>             {'unit': 64, 'activation': 'swish', 'batch_norm': True, 'l2': 1e-5},
+               >>>             {'unit': 32, 'activation': 'swish', 'batch_norm': True, 'l2': 1e-5},
+               >>>             {'unit': 32, 'activation': 'swish', 'batch_norm': True, 'l2': 1e-5}
+               >>>         ],
+               >>>         embedding=[(4, 9, 3, 0, 1e-7), 
+               >>>                    (2, 13, 3, 0, 1e-7), 
+               >>>                    (1, 3, 2, 0, 1e-7)],
+               >>>         batch_size=2048,
+               >>>         shuffle_size=2048000,
+               >>>         verbose=0,
+               >>>         validation_fraction=0.1,
+               >>>         learning_rate=0.01,
+               >>>         reduce_lr_on_plateau={'factor': 0.1, 'patience': 5},
+               >>>         early_stopping={'patience': 10},
+               >>>         epochs=150
+               >>>     )
+               >>>     return make_pipeline(ct, nn)
+               >>> clf_nn = create_nn_model()
+               >>> nn_prd = cross_val_predict(clf_nn, df_train, df_train[y], cv=5, method='predict_proba')[:, 1]
         """
         self.model_ = None
         self.network_config = network_config
@@ -201,7 +324,7 @@ class NNEstimator(BaseEstimator):
     def model_summary(self):
         self.model_.summary()
     
-    def fit_(self, X, y, loss, num_label=0):
+    def fit_(self, X, y, loss, metrics, num_label=0):
         if self.model_ is not None:
             self.model_ = None
         if self.random_state > 0:
@@ -236,6 +359,7 @@ class NNEstimator(BaseEstimator):
         self.model_ = create_model(inp, o, self.network_config, self.embedding)
         self.model_.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=self.learning_rate), 
+            metrics=metrics,
             loss=loss
         )
         history = self.model_.fit(ds_, epochs=self.epochs, 
@@ -245,8 +369,8 @@ class NNEstimator(BaseEstimator):
         tf.keras.backend.clear_session()
             
 class NNRegressor(NNEstimator, RegressorMixin):
-    def fit(self, X, y):
-        super().fit_(X, y, loss=tf.keras.losses.MeanSquaredError())
+    def fit(self, X, y, metrics=None):
+        super().fit_(X, y, metrics=metrics, loss=tf.keras.losses.MeanSquaredError())
         return self
     
     def predict(self, X):
@@ -258,12 +382,13 @@ class NNRegressor(NNEstimator, RegressorMixin):
         return r2_score(y, self.predict(X))
         
 class NNClassifier(NNEstimator, ClassifierMixin):
-    def fit(self, X, y, eval_set=None):
+    def fit(self, X, y, metrics=None, eval_set=None):
         self.is_binary = True
         if len(y.shape) == 1:
             self.le = LabelEncoder()
             y_lbl = self.le.fit_transform(y)
             self.is_binary = len(self.le.classes_) == 2
+            self.classes_ = self.le.classes_
         else:
             self.le = [LabelEncoder() for i in range(y.shape[-1])]
             if type(y) == np.ndarray:
@@ -275,7 +400,7 @@ class NNClassifier(NNEstimator, ClassifierMixin):
                     self.is_binary = False
             y_lbl = np.vstack(y_lbl).T
         if self.is_binary:
-            super().fit_(X, y_lbl, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True))
+            super().fit_(X, y_lbl, metrics=metrics, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True))
         else:
             if type(self.le) == list:
                 raise Exception('Only one target value in case two more label classes')
