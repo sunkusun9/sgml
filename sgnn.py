@@ -369,8 +369,14 @@ class NNEstimator(BaseEstimator):
         tf.keras.backend.clear_session()
             
 class NNRegressor(NNEstimator, RegressorMixin):
-    def fit(self, X, y, metrics=None):
-        super().fit_(X, y, metrics=metrics, loss=tf.keras.losses.MeanSquaredError())
+    def fit(self, X, y, loss='mse', metrics=None):
+        if loss.lower() == 'mse':
+            loss = tf.keras.losses.MeanSquaredError()
+        elif loss.lower() == 'mae':
+            loss = tf.keras.losses.MeanAbsoluteError()
+        else:
+            raise Exception("Unsupported loss: {}".format(loss))
+        super().fit_(X, y, metrics=metrics, loss=loss)
         return self
     
     def predict(self, X):
