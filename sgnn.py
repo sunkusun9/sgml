@@ -6,6 +6,7 @@ from sklearn.metrics import r2_score, accuracy_score
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from scipy.special import expit, softmax
+from sklearn.utils.multiclass import unique_labels
 
 def create_model(inp, o, config, embedding, 
                  l1=0, l2=0,
@@ -267,7 +268,6 @@ class NNEstimator(BaseEstimator):
                >>> clf_nn = create_nn_model()
                >>> nn_prd = cross_val_predict(clf_nn, df_train, df_train[y], cv=5, method='predict_proba')[:, 1]
         """
-        self.model_ = None
         self.network_config = network_config
         self.ordinal = ordinal
         self.embedding = embedding
@@ -317,23 +317,19 @@ class NNEstimator(BaseEstimator):
         self.validation_fraction =  params.get('validation_fraction', self.validation_fraction)
         self.lr_scheduler = params.get('lr_scheduler', self.lr_scheduler)
         self.verbose=params.get('verbose', self.verbose)
-        if self.model_ is not None:
-            self.model_ = None
-            tf.keras.backend.clear_session()
+        tf.keras.backend.clear_session()
     
     def model_summary(self):
         self.model_.summary()
     
     def fit_(self, X, y, loss, metrics, num_label=0):
-        if self.model_ is not None:
-            self.model_ = None
         if self.random_state > 0:
             tf.random.set_seed(self.random_state)
         tf.keras.backend.clear_session()
         cb = []
-        if self.validation_fraction > 0:
+        if self.validation_fraction > 0 and (num_label == 0 or y.shape[0] > num_label):
             assert self.validation_fraction < 1.0
-            if type(loss) != tf.keras.losses.MeanSquaredError:
+            if type(loss) != tf.keras.losses.MeanSquaredError and len(y.shape) == 1:
                 X, X_ev, y, y_ev = train_test_split(X, y, test_size = self.validation_fraction, 
                                                     random_state=self.random_state, stratify=y)
             else:
@@ -348,6 +344,7 @@ class NNEstimator(BaseEstimator):
             cb.append(tf.keras.callbacks.ReduceLROnPlateau(**self.reduce_lr_on_plateau))
         if self.lr_scheduler is not None:
             cb.append(tf.keras.callbacks.LearningRateScheduler(self.lr_scheduler, verbose=self.verbose))
+
         ds_, (inp, o) = create_dataset(X, y, self.ordinal, self.embedding, self.batch_size, self.shuffle_size)
         if eval_set is not None:
             ds_eval_, _ = create_dataset(eval_set[0], eval_set[1], 
@@ -367,6 +364,7 @@ class NNEstimator(BaseEstimator):
                                   callbacks=cb)
         self.history = history.history
         tf.keras.backend.clear_session()
+        return self
             
 class NNRegressor(NNEstimator, RegressorMixin):
     def fit(self, X, y, loss='mse', metrics=None):
@@ -406,14 +404,14 @@ class NNClassifier(NNEstimator, ClassifierMixin):
                     self.is_binary = False
             y_lbl = np.vstack(y_lbl).T
         if self.is_binary:
-            super().fit_(X, y_lbl, metrics=metrics, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True))
+            return super().fit_(X, y_lbl, metrics=metrics, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True))
         else:
             if type(self.le) == list:
                 raise Exception('Only one target value in case two more label classes')
-            super().fit_(X, y_lbl, 
+            return super().fit_(X, y_lbl, metrics=metrics,
                          loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), 
                          num_label=len(self.le.classes_))
-    
+        
     def predict(self, X):
         ds_, _ = create_dataset(X, ordinal=self.ordinal, 
                                 embedding=self.embedding, batch_size=self.batch_size, shuffle_size=0)
@@ -451,7 +449,12 @@ class NNClassifier(NNEstimator, ClassifierMixin):
                 return softmax(self.model_.predict(ds_, verbose=self.verbose), axis=-1)
 
     def decision_function(self, X):
-        return self.predict(X)
+        ds_, _ = create_dataset(X, ordinal=self.ordinal, 
+                                embedding=self.embedding, batch_size=self.batch_size, shuffle_size=0)
+        if type(self.le) == list:
+            prd = self.model_.predict(ds_, verbose=self.verbose)
+            return [prd[:, i] for i in range(len(self.le))]
+        return self.model_.predict(ds_, verbose=self.verbose)
 
     def score(self, X, y, sample_weight=None):
         if len(y.shape) == 1:
