@@ -76,7 +76,13 @@ def create_model(inp, o, config, embedding,
             kreg = tf.keras.regularizers.L2(l2)
         else:
             kreg = None
-        X = tf.keras.layers.Dense(i['unit'], activation=i.get('activation', None), 
+        activation = i.get('activation', None)
+        if activation in ['sigmoid', 'tanh']:
+            kinit = tf.keras.initializers.GlorotNormal()
+        else:
+            kinit = tf.keras.initializers.HeNormal()
+        X = tf.keras.layers.Dense(i['unit'], activation=activation, 
+                                  kernel_initializer=kinit,
                                   kernel_regularizer=kreg,
                                   name='l_{}'.format(l_cnt))(X)
         bn = i.get('batch_norm', False)
