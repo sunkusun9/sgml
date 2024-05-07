@@ -58,9 +58,9 @@ def create_model(inp, o, config, embedding,
                     kreg = None
                 X_emb = tf.keras.layers.Embedding(v[1], v[2], embeddings_regularizer = kreg,
                                                   dtype=cont_dtype, name=k+'_emb')(X_inp[k])
-                X_emb = tf.reshape(X_emb, (-1, v[2] * v[3]), name=k + '_reshape_emb')
+                X_emb = tf.keras.layers.Reshape((v[2] * v[3],), name=k + '_reshape_emb')(X_emb)
                 X_cat.append(X_emb)
-        X = tf.concat(X_cat, axis=-1, name='concat_inputs')
+        X = tf.keras.layers.Concatenate(axis=-1, name='concat_inputs')(X_cat)
     else:
         X_inp = tf.keras.Input(dtype=cont_dtype, shape=(inp, ), name='input_layer')
         X = X_inp
@@ -117,7 +117,7 @@ def create_dataset(X, y=None, ordinal=None, embedding=None, batch_size=512, shuf
                 If ordinal is the number, ordinal is the size of ordinal inputs.
             embedding: list
                 If X is DataFrame, the list is consisted of (list of columns, input dimension, output dimension, l1 regularization, l2 regularization) tuples
-                If X is DataFrame, the list is consisted of (the size of input, input dimension, output dimension, l1 regularization, l2 regularization) tuples
+                If X is numpy array, the list is consisted of (the size of input, input dimension, output dimension, l1 regularization, l2 regularization) tuples
             batch_size: integer
                 The size of the batch of the dataset.
             shuffle_size: integer
@@ -328,7 +328,7 @@ class NNEstimator(BaseEstimator):
     def model_summary(self):
         self.model_.summary()
     
-    def fit_(self, X, y, loss, metrics, num_label=0):
+    def fit_(self, X, y, loss, metrics, num_label=0, eval_set=None):
         if self.random_state > 0:
             tf.random.set_seed(self.random_state)
         tf.keras.backend.clear_session()
@@ -342,8 +342,6 @@ class NNEstimator(BaseEstimator):
                 X, X_ev, y, y_ev = train_test_split(X, y, test_size = self.validation_fraction, 
                                                     random_state=self.random_state)
             eval_set = (X_ev, y_ev)
-        else:
-            eval_set = None
         if self.early_stopping is not None:
             cb.append(tf.keras.callbacks.EarlyStopping(**self.early_stopping))
         if self.reduce_lr_on_plateau is not None:
@@ -368,19 +366,19 @@ class NNEstimator(BaseEstimator):
         history = self.model_.fit(ds_, epochs=self.epochs, 
                                   validation_data=ds_eval_, verbose=self.verbose,
                                   callbacks=cb)
-        self.history = history.history
+        self.history_ = history.history
         tf.keras.backend.clear_session()
         return self
             
 class NNRegressor(NNEstimator, RegressorMixin):
-    def fit(self, X, y, loss='mse', metrics=None):
+    def fit(self, X, y, loss='mse', metrics=None, eval_set=None):
         if loss.lower() == 'mse':
             loss = tf.keras.losses.MeanSquaredError()
         elif loss.lower() == 'mae':
             loss = tf.keras.losses.MeanAbsoluteError()
         else:
             raise Exception("Unsupported loss: {}".format(loss))
-        super().fit_(X, y, metrics=metrics, loss=loss)
+        super().fit_(X, y, metrics=metrics, loss=loss, eval_set=eval_set)
         return self
     
     def predict(self, X):
@@ -416,7 +414,7 @@ class NNClassifier(NNEstimator, ClassifierMixin):
                 raise Exception('Only one target value in case two more label classes')
             return super().fit_(X, y_lbl, metrics=metrics,
                          loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), 
-                         num_label=len(self.le.classes_))
+                         num_label=len(self.le.classes_), eval_set=eval_set)
         
     def predict(self, X):
         ds_, _ = create_dataset(X, ordinal=self.ordinal, 
