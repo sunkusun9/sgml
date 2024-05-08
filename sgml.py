@@ -165,8 +165,8 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
         sp_y: str
             splitter y value name
     Returns
-        object, dict
-        model instance, train result 
+        list, list, Series, list
+        train_metrics, valid_metrics, s_prd, model_result_cv
     Example
     >>> X_cont =['Diameter', 'Whole weight.2', 'Whole weight.1', 'Shell weight', 'Length', 'Height_n', 'Whole weight']
     >>> X_cat = ['Sex']
@@ -198,8 +198,8 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
             df_cv_train = train_data_proc(df_cv_train)
         m, train_result = train_model(model, model_params, df_cv_train, X, y, preprocessor=preprocessor, **train_params)
         valid_prds.append(predict_func(m, df_valid, X))
-        valid_metrics.append(eval_metric(df_valid[y], valid_prds[-1]))
-        train_metrics.append(eval_metric(df_cv_train[y], predict_func(m, df_cv_train, X)))
+        valid_metrics.append(eval_metric(df_valid, valid_prds[-1]))
+        train_metrics.append(eval_metric(df_cv_train, predict_func(m, df_cv_train, X)))
         if result_proc is not None:
             if preprocessor is None:
                 train_result = result_proc(m, train_result)
@@ -343,6 +343,9 @@ class SGStacking:
         result_new_['best_result'] = result_['best_result']
         self.model_result[model_name] = result_new_
 
+    def reset_model(self, model_name):
+        del self.model_result[model_name]
+    
     def get_best_results(self, model_names):
         tmp = list()
         for model_name in model_names:
@@ -495,7 +498,7 @@ class SGStacking:
         if train_data_proc is not None:
             df = train_data_proc(df)
         m, train_result = train_model(model, model_params, df, X, y, preprocessor=preprocessor, **train_params)
-        train_metric = self.eval_metric(df[y], self.predict_func(m, df, X))
+        train_metric = self.eval_metric(df, self.predict_func(m, df, X))
         if result_proc is not None:
             if preprocessor is None:
                 train_result = result_proc(m, train_result)
@@ -543,7 +546,7 @@ class SGStacking:
         )
         return train_metrics, valid_metrics, model_result_cv
     
-    def fit(self, model, model_params, model_names, s_y, result_proc=None, train_params={}):
+    def fit(self, model, model_params, model_names, df, y, result_proc=None, train_params={}):
         """
         fit the meta model
         Parameters:
@@ -565,9 +568,9 @@ class SGStacking:
         """
         df = pd.concat([
                 self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [s_y], axis=1).sort_index()
-        m, train_result = train_model(model, model_params, df, model_names, s_y.name, **train_params)
-        train_metric = self.eval_metric(s_y, self.predict_func(m, df, model_names))
+            ] + [df], axis=1).sort_index()
+        m, train_result = train_model(model, model_params, df, model_names, y, **train_params)
+        train_metric = self.eval_metric(df, self.predict_func(m, df, model_names))
         if result_proc is not None:
             train_result = result_proc(m, train_result)
         self.meta_model = m
