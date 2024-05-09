@@ -300,57 +300,6 @@ def select_opr(dfl, select_proc, desc, df_feat=None):
     dfl = dfl.with_columns(*d)
     return dfl.hstack(dfl_proc), df_feat
 
-
-def select_opr(dfl, select_proc, desc, df_feat=None):
-    """
-    apply select_proc
-    Parameters:
-        dfl: pl.DataFrame
-            Data DataFrame to process
-        processor: Function
-            dfl proccesing function
-        X_val: list
-            Proprocessign target variable names
-        info_prov: Function
-            The function provide columns information
-        df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not make feature information
-    Returns:
-        pl.DataFrame, pd.Dataframe
-            Data DataFrame, Feature DataFrame
-    Examples:
-        >>> dfl_merge = dfl_merge.sort('pca0')
-        >>> sig = 1.96
-        >>> clip_target = lambda x: x.select(
-        >>>             pl.col('target'),
-        >>>         ).with_columns(
-        >>>             pl.col('target').rolling_mean(101, center=True, min_periods=50).alias('mean_'),
-        >>>             pl.col('target').rolling_std(101, center=True, min_periods=50).alias('std_')
-        >>>         ).select(
-        >>>             pl.col('target').clip(
-        >>>                 pl.col('mean_') - pl.col('std_') * sig, 
-        >>>                 pl.col('mean_') + pl.col('std_') * sig
-        >>>             ).cast(pl.Float32).alias('target_b')
-        >>>         )
-        >>> desc = [('clip_rolling', 'target의 범위를 pca0를 기준으로 rolling 통계를 이용하여 고정시킵니다.')]
-        >>> dfl_merge, df_feature = select_opr(dfl_merge, clip_target, desc, df_feature)
-    """
-    dfl_proc = select_proc(dfl)
-    if df_feat is not None:
-        df_feat_ = pd.DataFrame({
-            'val': dfl_proc.columns,
-            'type': [str(i) for i in dfl_proc.dtypes], 
-            'Description': [i[1] for i in desc],
-            'src': [i[0] for i in desc],
-        }).set_index('val')
-        df_feat = pd.concat([df_feat, df_feat_], axis=0)
-    d = []
-    for i in dfl_proc.columns:
-        if i in dfl.columns:
-            d.append(dfl_proc.drop_in_place(i))
-    dfl = dfl.with_columns(*d)
-    return dfl.hstack(dfl_proc), df_feat
-
 def apply_procs(dfl, procs, df_feat=None):
     """
     apply preprocessors
