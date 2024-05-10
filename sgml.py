@@ -210,9 +210,13 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
     return train_metrics, valid_metrics, s_prd, model_result_cv
 
 class SGStacking:
-    def __init__(self, sp, predict_func, eval_metric, greater_better=True):
+    def __init__(self, df_train, target, sp, predict_func, eval_metric, greater_better=True, sp_y=None):
         """
         Parameters
+            df_train: pd.DataFrame
+                training data
+            target: str
+                target value name
             sp: Splitter
                 sklearn spliiter object
             predict_func: function
@@ -221,14 +225,18 @@ class SGStacking:
                 evaluation metric function
             greater_better: Boolean
                 True: the greater, the better False: the greater, the worse
+            sp_y: str
+                value name for splitter target, if None target value used
         Examples
         >>> cv5 = StratifiedKFold(n_splits=5, random_state=123, shuffle=True)
         >>> def predict(m, df_valid, X):
         >>>     return pd.Series(m.predict(df_valid[X]), index=df_valid.index)
         >>> def eval_metric(y_true, prds):
         >>>     return mean_squared_error(y_true.sort_index(), prds.sort_index()) ** 0.5
-        >>> stk = SGStacking(sp=cv5, predict_func=predict, eval_metric=eval_metric,  greater_better=False)
+        >>> stk = SGStacking(df_train, 'target', sp=cv5, predict_func=predict, eval_metric=eval_metric,  greater_better=False)
         """
+        self.df_train = df_train
+        self.target = target
         self.sp = sp
         self.predict_func = predict_func
         self.eval_metric = eval_metric
@@ -237,8 +245,9 @@ class SGStacking:
         self.greater_better = greater_better
         self.meta_model = None
         self.meta_X = None
+        self.sp_y = sp_y
 
-    def get_result(self, model_name, model, model_param, X):
+    def get_result(self, model_name, model, preprocessor, model_param, X):
         """
         get the results of the model
         Parameters:
@@ -246,6 +255,8 @@ class SGStacking:
                 model name
             model: Class
                 Class of model
+            preprocessor: object
+                sklearn preprocessor object
             model_param: dict
                 model parameter
             X: list
@@ -261,11 +272,12 @@ class SGStacking:
         """
         if model_name in self.model_result:
             result_ = self.model_result[model_name]
-            model_key = str(model) + str(model_param) + ','.join(X)
+            model_key = str(model) + str(preprocessor) + str(model_param) + ','.join(X)
             if model_key in result_['model_key']:
                 idx = result_['model_key'].index(model_key)
                 return {
                     'model': result_['model'][idx],
+                    'preprocessor': result_['preprocessor'][idx],
                     'model_param': result_['model_params'][idx],
                     'train_metrics': result_['train_metrics'][idx],
                     'valid_metrics': result_['valid_metrics'][idx],
@@ -273,12 +285,13 @@ class SGStacking:
             return None
         return None
     
-    def _put_result(self, model_name, model, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv):
-        model_key = str(model) + str(model_params) + ','.join(X)
+    def _put_result(self, model_name, model, preprocessor, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv, train_info):
+        model_key = str(model) + str(preprocessor) + str(model_params) + ','.join(X)
         if model_name in self.model_result:
             result_ = self.model_result[model_name]
             if model_key in result_['model_key']:
                 idx = result_['model_key'].index(model_key)
+                result_['train_info'][idx] = train_info
                 result_['train_metrics'][idx] = train_metrics
                 result_['valid_metrics'][idx] = valid_metrics
                 metric = np.mean(valid_metrics)
@@ -293,20 +306,24 @@ class SGStacking:
             result_ = {
                 'model_key': [],
                 'model': [],
+                'preprocessor': [],
                 'model_params': [],
                 'X': [],
                 'train_metrics': [],
                 'valid_metrics': [],
                 'metric': [],
+                'train_info': [],
                 'best_result': None
             }
             self.model_result[model_name] = result_
         result_['model_key'].append(model_key)
         result_['model'].append(model)
+        result_['preprocessor'].append(preprocessor)
         result_['model_params'].append(model_params)
         result_['X'].append(X)
         result_['train_metrics'].append(train_metrics)
         result_['valid_metrics'].append(valid_metrics)
+        result_['train_info'].append(train_info)
         metric = np.mean(valid_metrics)
         if result_['best_result'] is None or \
             (self.greater_better and metric >= np.max(result_['metric'])) or \
@@ -335,11 +352,13 @@ class SGStacking:
         else:
             idx = np.argmin(result_['metric'])
         result_new_['model'].append(result_['model'][idx])
+        result_new_['preprocessor'].append(result_['preprocessor'][idx])
         result_new_['model_params'].append(result_['model_params'][idx])
         result_new_['X'].append(result_['X'][idx])
         result_new_['train_metrics'].append(result_['train_metrics'][idx])
         result_new_['valid_metrics'].append(result_['valid_metrics'][idx])
         result_new_['metric'].append(result_['metric'][idx])
+        result_new_['train_info'].append(result_['train_info'][idx])
         result_new_['best_result'] = result_['best_result']
         self.model_result[model_name] = result_new_
 
@@ -356,10 +375,12 @@ class SGStacking:
             else:
                 idx = np.argmin(result_['metric'])
             result_new_['model'] = result_['model'][idx]
+            result_new_['preprocessor'] = result_['preprocessor'][idx]
             result_new_['model_params'] = result_['model_params'][idx]
             result_new_['X'] = result_['X'][idx]
             result_new_['train_metrics'] = result_['train_metrics'][idx]
             result_new_['valid_metrics'] = result_['valid_metrics'][idx]
+            result_new_['train_info'] = result_['train_info'][idx]
             tmp.append(pd.Series(result_new_))
         return pd.DataFrame(tmp).assign(
             model = lambda x: x['model'].apply(lambda x: str(x).split('.')[-1][:-2]),
@@ -368,8 +389,8 @@ class SGStacking:
             valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
         )
     
-    def eval_model(self, model_name, model, model_params, df, X, y, 
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, sp_y=None, rerun=False):
+    def eval_model(self, model_name, model, model_params, X,  
+                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, rerun=False):
         """
         Evaluate a base model and store the result.
         Parameters:
@@ -379,12 +400,8 @@ class SGStacking:
                 Model class
             model_param: dict
                 Model hyper parameters
-            df: pd.DataFrame
-                cross-validate data
             X: list
                 input variable names
-            y: str
-                target variable
             preprocessor: sklearn.preprocessing. 
                 preprocessor. it will be connected using make_pipeline
             result_proc: function
@@ -393,35 +410,36 @@ class SGStacking:
                 the processor for traing data
             train_params: 
                 the parameter for train_model
-            sp_y: str
-                splitter y value name
             rerun: Boolean
-                Rerun all the 
+                Rerun
         Returns
             object, dict
             model instance, train result 
         Example
         >>> lgb_result, train_result = stk.eval_model(
-        >>>    'lgb_1', lgb.LGBMRegressor, {'verbose': -1, 'n_estimators': 140}, dataset['train'], X_all, target,
+        >>>    'lgb_1', lgb.LGBMRegressor, {'verbose': -1, 'n_estimators': 140}, X_all,
         >>>    result_proc=lgb_learning_result,
         >>>    train_params={
         >>>         'valid_splitter': valid_splitter, 
         >>>         'fit_params': {'categorical_feature': ['Sex'], 'callbacks': [lgb.early_stopping(5, verbose=False)]}, 
         >>>         'valid_config_proc': gb_valid_config
-        >>>     }, sp_y = 'Rings'
+        >>>     }
         >>> )
         """
         if not rerun:
-            result = self.get_result(model_name, model, model_params, X)
+            result = self.get_result(model_name, model, preprocessor, model_params, X)
             if result != None:
                 return result, None
         train_metrics, valid_metrics, s_prd, model_result_cv = \
             cv_model(
-                self.sp, model, model_params, df, X, y, self.predict_func, self.eval_metric,
-                preprocessor=preprocessor, result_proc=result_proc, train_data_proc=train_data_proc, train_params=train_params, sp_y=sp_y
+                self.sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric,
+                preprocessor=preprocessor, result_proc=result_proc, train_data_proc=train_data_proc, train_params=train_params, sp_y=self.sp_y
             )
-        self._put_result(model_name, model, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv)
-        return self.get_result(model_name, model, model_params, X), model_result_cv
+        train_info = {
+            'result_proc': result_proc, 'train_data_proc': train_data_proc, 'train_params': train_params
+        }
+        self._put_result(model_name, model, preprocessor, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv, train_info)
+        return self.get_result(model_name, model, preprocessor, model_params, X), model_result_cv
 
     def get_model_results(self, model_name):
         """
@@ -441,33 +459,12 @@ class SGStacking:
             valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
         )
         
-    def select_model(self, model_name, df, X, y, 
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, rerun=False):
+    def select_model(self, model_name, rerun=False):
         """
         Select the model and fit the model with the best parameter for base model. And store the model instance and cv prediction of the model.
         Parameters:
             model_name: str
                 모델명
-            model: Class
-                Model class
-            model_param: dict
-                Model hyper parameters
-            df: pd.DataFrame
-                cross-validate data
-            X: list
-                input variable names
-            y: str
-                target variable
-            preprocessor: sklearn.preprocessing. 
-                preprocessor. it will be connected using make_pipeline
-            result_proc: function
-                the processor for the result of training 
-            train_data_proc: function
-                the processor for traing data
-            train_params: 
-                the parameter for train_model
-            rerun: Boolean
-                Rerun all the 
         Returns:
             object, dict, float
             model instance, train result, train metric
@@ -476,7 +473,7 @@ class SGStacking:
         >>> lgb_result, train_result = stk.eval_model(
         >>>     'lgb_1', lgb.LGBMRegressor, 
         >>>     {'verbose': -1, 'n_estimators': 1500, 'learning_rate': 0.01, 'colsample_bytree': 0.75, 'subsamples': 0.75, 'num_leaves': 63}, 
-        >>>     dataset['train'], X_all, target,
+        >>>     X_all, 
         >>>     result_proc=lgb_learning_result,
         >>>     train_data_proc=partial(merge_org, df_org=df_org),
         >>>     train_params={
@@ -485,6 +482,7 @@ class SGStacking:
         >>>         'valid_config_proc': gb_valid_config
         >>>     }, sp_y = 'Rings'
         >>> )    
+        >>> stk.select_model('lgb_1')
         """
         if not rerun and model_name in self.selected_models:
             return self.selected_models[model_name][0], self.selected_models[model_name][1], self.selected_models[model_name][2]
@@ -494,11 +492,18 @@ class SGStacking:
         else:
             idx = np.argmin(result_['metric'])
         model = result_['model'][idx]
+        preprocessor = result_['preprocessor'][idx]
+        X = result_['X'][idx]
         model_params = result_['model_params'][idx]
+
+        train_info = result_['train_info'][idx]
+        train_data_proc = train_info['train_data_proc']
+        train_params = train_info['train_params']
+        result_proc = train_info['result_proc']        
         if train_data_proc is not None:
             df = train_data_proc(df)
-        m, train_result = train_model(model, model_params, df, X, y, preprocessor=preprocessor, **train_params)
-        train_metric = self.eval_metric(df, self.predict_func(m, df, X))
+        m, train_result = train_model(model, model_params, self.df_train, X, self.target, preprocessor=preprocessor, **train_params)
+        train_metric = self.eval_metric(self.df_train, self.predict_func(m, self.df_train, X))
         if result_proc is not None:
             if preprocessor is None:
                 train_result = result_proc(m, train_result)
@@ -508,8 +513,11 @@ class SGStacking:
             m, X, train_result, train_metric
         )
         return m, train_result, train_metric
-   
-    def eval_meta_model(self, model, model_params, model_names, df, y, result_proc=None, train_params={}, sp_y=None):
+
+    def get_selected_model(self):
+        return list(self.selected_models.keys())
+    
+    def eval_meta_model(self, model, model_params, model_names, result_proc=None, train_params={}, inc_vals=[]):
         """
         Evaluate the meta model
         Parameters:
@@ -517,32 +525,29 @@ class SGStacking:
                 Model class
             model_param: dict
                 Model hyper parameters
-            df: pd.DataFrame
-                cross-validate data
-            X: list
-                input variable names
-            y: str
-                target variable
-            preprocessor: sklearn.preprocessing. 
-                preprocessor. it will be connected using make_pipeline
+            model_names: list
+                the name list of base models to include meta model
             result_proc: function
                 the processor for the result of training 
             train_data_proc: function
                 the processor for traing data
             train_params: 
                 the parameter for train_model
-            rerun: Boolean
-                Rerun all the 
+            inc_vals: list
+                the variables names to include to the meta model data
         Returns:
-            object, dict, float
-            model instance, train result, train metric
+            list, list, list
+            train_metric, valid_metrics, cv results
         """
+        vals = [self.target] + inc_vals
+        if self.sp_y is not None:
+            vals.append(self.sp_y)
         df = pd.concat([
                 self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [df], axis=1).sort_index()
+            ] + [self.df_train[vals]], axis=1).sort_index()
         train_metrics, valid_metrics, s_prd, model_result_cv = cv_model(
-            self.sp, model, model_params, df, model_names, y, self.predict_func, self.eval_metric, 
-            result_proc=result_proc, train_params=train_params, sp_y=sp_y
+            self.sp, model, model_params, df, model_names, self.target, self.predict_func, self.eval_metric, 
+            result_proc=result_proc, train_params=train_params, sp_y=self.sp_y
         )
         return train_metrics, valid_metrics, model_result_cv
     
@@ -585,7 +590,7 @@ class SGStacking:
                 input dataframe
         Returns:
             ndarray
-                예측 결과
+                result of prediction
         """
         prds = list()
         for m_ in self.meta_X:
@@ -598,9 +603,9 @@ class SGStacking:
         predict with a base model
         Parameters:
             model_name: str
-                모델명
+                the name of base model
             df: pd.DataFrame
-            
+                the data to predict 
         """
         m, X, _, _ = self.selected_models[model_name]
         return self.predict_func(m, df, X).rename(model_name)
@@ -613,6 +618,8 @@ class SGStacking:
                 file name
         """
         model_contents = {
+            'df_train': self.df_train,
+            'target': self.target,
             'splitter': self.sp,
             'predict_func': self.predict_func,
             'eval_metric': self.eval_metric,
@@ -620,7 +627,8 @@ class SGStacking:
             'selected_models': self.selected_models,
             'greater_better': self.greater_better,
             'meta_model': self.meta_model,
-            'meta_X': self.meta_X
+            'meta_X': self.meta_X,
+            'sp_y': self.sp_y
         }
         with open(file_name, 'wb') as f:
             pkl.dump(model_contents, f)
@@ -634,7 +642,11 @@ class SGStacking:
         """
         with open(file_name, 'rb') as f:
             model_contents = pkl.load(f)
-        stk = SGStacking(model_contents['splitter'], model_contents['predict_func'], model_contents['eval_metric'], model_contents['greater_better'])
+        stk = SGStacking(
+            model_contents['df_train'], model_contents['target'],
+            model_contents['splitter'], model_contents['predict_func'], model_contents['eval_metric'], model_contents['greater_better'],
+            sp_y = model_contents['sp_y']
+        )
         stk.model_result = model_contents['model_result']
         stk.selected_models = model_contents['selected_models']
         stk.meta_model = model_contents['meta_model']
