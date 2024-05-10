@@ -579,17 +579,32 @@ class SGStacking:
     
     def predict(self, df):
         """
-        predict the values
+        predict with stacking model
         Parameters:
-            df: DataFrame
+            df: pd.DataFrame
                 input dataframe
+        Returns:
+            ndarray
+                예측 결과
         """
         prds = list()
         for m_ in self.meta_X:
             m, X, _, _ = self.selected_models[m_]
-            prds.append(pd.Series(m.predict(df[X]), name=m_))
+            prds.append(self.predict_func(m, df, X).rename(m_))
         return self.meta_model.predict(pd.concat(prds, axis=1))
 
+    def predict_with_base(self, model_name, df):
+        """
+        predict with a base model
+        Parameters:
+            model_name: str
+                모델명
+            df: pd.DataFrame
+            
+        """
+        m, X, _, _ = self.selected_models[model_name]
+        return self.predict_func(m, df, X).rename(model_name)
+        
     def save_model(self, file_name):
         """
         save this model
