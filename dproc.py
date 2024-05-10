@@ -162,7 +162,7 @@ def get_type_pd(df_type, predefine={}, f32=True, i64=False, cat_max=np.inf, txt_
         ret_type[i] = 'string'
     return ret_type
 
-def with_column_opr(dfl, proc_list, df_feat=None):
+def with_columns_opr(dfl, proc_list, df_feat=None):
     """
     pl.with_column processing
     Parameters:
@@ -309,7 +309,7 @@ def apply_procs(dfl, procs, df_feat=None):
         procs: list
             list of processor
         df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not make feature information
+            Feature DataFrame, if None, does not fit model and make feature information
     Returns:
         pl.DataFrame, pd.Dataframe
             Data DataFrame, Feature DataFrame
@@ -352,7 +352,7 @@ def ord_prov(p, v):
     """
     Information provider for Oridinal Encoder
     """
-    return ('ord', p, 'OrdinalEncoder: ' + v, pl.Int16)
+    return ('ord', p, 'OrdinalEncoder: ' + p, pl.Int16)
 
 def ohe_prov(p, v):
     """
