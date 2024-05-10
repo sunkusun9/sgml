@@ -56,14 +56,9 @@ def merge_type_df(dfs):
     Examples:
         >>> merge_type_df([pl.scan_csv(i).pipe(get_type_df) for i in glob(*.csv)])
     """
-    df_ret = dfs[0].copy()
-    for df in dfs[1:]:
-        df_ret['min'] = df_ret['min'].where(df_ret['min'] < df['min'], df['min'])
-        df_ret['max'] = df_ret['max'].where(df_ret['max'] > df['max'], df['max'])
-        df_ret[['na', 'count']] = df_ret[['na', 'count']] + df[['na', 'count']]
-        df_ret[['f32', 'i32', 'i16', 'i8']] = df_ret[['f32', 'i32', 'i16', 'i8']] & df[['f32', 'i32', 'i16', 'i8']]
-    df_ret['n_unique'] = pd.concat([i['n_unique'] for i in dfs], axis=1).mean(axis=1)
-    return df_ret
+    return pd.concat(dfs, axis=0).pipe(lambda x: x.groupby(x.index).agg(
+        {'min': 'min', 'max': 'max', 'na': 'sum', 'count': 'sum', 'n_unique': 'mean', 'dtype': 'max', 'f32': 'all', 'i32': 'all', 'i16': 'all', 'i8': 'all'})
+    )
 
 def get_type_pl(df_type, predefine={}, f32=True, i64=False, cat_max=np.inf, txt_cols = []):
     """
