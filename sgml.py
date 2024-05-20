@@ -332,6 +332,17 @@ class SGStacking:
             if model_name in self.selected_models:
                 del self.selected_models[model_name]
         result_['metric'].append(metric)
+
+    def append_vars(self, pd_vars):
+        """
+        Append varaibles to train data
+        Parameters:
+            pd_vars: pd.DataFrame or pd.Series
+        """
+        if (pd_vars.index == self.df_train.index).all():
+            self.df_train = pd.concat([self.df_train, pd_vars], axis=1)
+        else:
+            raise Exception("pd_vars should have same index with existing train data")
     
     def compact_result(self, model_name):
         """
@@ -388,6 +399,16 @@ class SGStacking:
             train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
             valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
         )
+
+    def get_best_result(self, model_name):
+        result_ = self.model_result[model_name]
+        if self.greater_better:
+            idx = np.argmax(result_['metric'])
+        else:
+            idx = np.argmin(result_['metric'])
+        
+        ret = self.get_result(model_name, result_['model'][idx], result_['preprocessor'][idx], result_['model_params'][idx], result_['X'][idx])
+        return ret, result_['best_result'][1]
     
     def eval_model(self, model_name, model, model_params, X,  
                    preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, rerun=False):
@@ -414,7 +435,7 @@ class SGStacking:
                 Rerun
         Returns
             object, dict
-            model instance, train result 
+            model information, train result 
         Example
         >>> lgb_result, train_result = stk.eval_model(
         >>>    'lgb_1', lgb.LGBMRegressor, {'verbose': -1, 'n_estimators': 140}, X_all,
@@ -551,7 +572,7 @@ class SGStacking:
         )
         return train_metrics, valid_metrics, model_result_cv
     
-    def fit(self, model, model_params, model_names, df, y, result_proc=None, train_params={}):
+    def fit(self, model, model_params, model_names, result_proc=None, train_params={}):
         """
         fit the meta model
         Parameters:
@@ -561,8 +582,6 @@ class SGStacking:
                 the parameter of meta model
             model_names:
                 the names of base model
-            s_y: Series or DataFrame
-                the target value(s)
             result_proc: function
                 the function to extract the result
             train_params: dict
@@ -573,8 +592,8 @@ class SGStacking:
         """
         df = pd.concat([
                 self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [df], axis=1).sort_index()
-        m, train_result = train_model(model, model_params, df, model_names, y, **train_params)
+            ] + [self.df_train[self.target]], axis=1).sort_index()
+        m, train_result = train_model(model, model_params, df, model_names, self.target, **train_params)
         train_metric = self.eval_metric(df, self.predict_func(m, df, model_names))
         if result_proc is not None:
             train_result = result_proc(m, train_result)
