@@ -253,8 +253,6 @@ def select_opr(dfl, select_proc, desc, src, df_feat=None):
             Data DataFrame to process
         processor: Function
             dfl proccesing function
-        X_val: list
-            Proprocessign target variable names
         desc: Function
             The function provide columns information
         src: str
