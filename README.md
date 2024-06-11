@@ -17,4 +17,8 @@ Stacking을 구성하기 위한 모델을 가지고 실험한 결과를 유지�
 
 dproc
 
-Tabular Data를 처리하기 위한 도구 모음
+Tabular Data를 처리하기 위한 도구 모음입니다.
+
+sgutil
+
+유틸성 기능 모음입니다.
