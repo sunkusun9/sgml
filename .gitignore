@@ -1,0 +1,8 @@
+# 데이터와 이미지 파일은 제외
+data/
+img/
+tmp/
+.ipynb_checkpoints/
+__pycache__/
+result/
+catboost_info/
