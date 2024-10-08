@@ -3,6 +3,7 @@ import numpy as np
 import polars as pl
 import polars.selectors as cs
 from functools import partial
+from itertools import product
 
 def get_type_df(df):
     """
@@ -251,7 +252,7 @@ def select_opr(dfl, select_proc, desc, src, df_feat=None):
     Parameters:
         dfl: pl.DataFrame
             Data DataFrame to process
-        processor: Function
+        select_proc: Function
             dfl proccesing function
         desc: Function
             The function provide columns information
@@ -343,14 +344,36 @@ def apply_procs(dfl, procs, df_feat=None):
             dfl, df_feat = dfl.pipe(partial(proc, df_feat=df_feat))
     return dfl, df_feat
 
-def ord_prov(p, v):
+def ord_prov(p, v, suffix=None):
     """
     Information provider for Oridinal Encoder
     """
-    return ('ord', p, 'OrdinalEncoder: ' + p, pl.Int16)
+    if suffix is None:
+        return ('ord', p, 'OrdinalEncoder: ' + p, pl.Int16)
+    else:
+        return ('ord', p + '_' + suffix, 'OrdinalEncoder: ' + p, pl.Int16)
 
 def ohe_prov(p, v):
     """
     Information provider for OneHot Encoder
     """
     return ('ohe', p, 'OneHotEncoder: ' + v, pl.Int8)
+
+
+def combine_cat(df):
+    """
+    Combines multiple categorical columns in a DataFrame into a single categorical variable, in efficient way. 
+
+    Parameters:
+        df (pd.DataFrame): DataFrame where each column is of categorical dtype.
+
+    Returns:
+        pd.Series: A Series containing a new categorical variable that represents 
+                   the unique combination of all input categorical columns.
+    """
+    return pd.Series(
+        pd.Categorical.from_codes(
+            df.apply(lambda x: x.cat.codes).dot(df.nunique().shift(1).fillna(1).astype('int').cumprod()), 
+            [''.join(i) for i in product(*df.apply(lambda x: x.cat.categories.astype('str').tolist(), result_type='reduce'))]
+        ), index=df.index
+    )
