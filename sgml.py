@@ -15,7 +15,13 @@ def gb_valid_config2(train_set, valid_set):
 def sgnn_valid_config(train_set, valid_set):
     return {}, {'eval_set': valid_set if valid_set is not None else train_set}
 
-def lgb_learning_result(m, train_result):
+def pass_learning_result(m, train_result, preprocessor=None):
+    if preprocessor is None:
+        return m, train_result
+    else:
+        return make_pipeline(preprocessor, m), train_result
+
+def lgb_learning_result(m, train_result, preprocessor=None):
     return (
         pd.concat([
             pd.DataFrame(
@@ -30,7 +36,7 @@ def lgb_learning_result(m, train_result):
         train_result
     )
 
-def xgb_learning_result(m, train_result):
+def xgb_learning_result(m, train_result, preprocessor=None):
     return (
         pd.concat([
             pd.DataFrame(
@@ -45,7 +51,7 @@ def xgb_learning_result(m, train_result):
         train_result
     )
 
-def cb_learning_result(m, train_result):
+def cb_learning_result(m, train_result, preprocessor=None):
     return (
         pd.concat([
             pd.DataFrame(
@@ -60,7 +66,7 @@ def cb_learning_result(m, train_result):
         train_result
     )
 
-def sgnn_learning_result(m, train_result):
+def sgnn_learning_result(m, train_result, preprocessor=None):
     return (
         pd.DataFrame(m.history_),
         train_result
@@ -220,7 +226,7 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
             if preprocessor is None:
                 train_result = result_proc(m, train_result)
             else:
-                train_result = result_proc(m[-1], train_result)
+                train_result = result_proc(m[-1], train_result, m[0])
         model_result_cv.append(train_result)
     s_prd = pd.concat(valid_prds, axis=0)
     return train_metrics, valid_metrics, s_prd, model_result_cv
