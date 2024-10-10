@@ -74,7 +74,7 @@ def get_type_pl(df_type, predefine={}, f32=True, i64=False, cat_max=np.inf, txt_
         i64: Boolean
             use i64 for all integer types
         cat_max: Int
-            maximum category number for categorical types
+            maximum number of categories for categorical types
         txt_cols: list
             Text type columns
     Returns:
@@ -360,12 +360,13 @@ def ohe_prov(p, v):
     return ('ohe', p, 'OneHotEncoder: ' + v, pl.Int8)
 
 
-def combine_cat(df):
+def combine_cat(df, delimiter=''):
     """
     Combines multiple categorical columns in a DataFrame into a single categorical variable, in efficient way. 
 
     Parameters:
         df (pd.DataFrame): DataFrame where each column is of categorical dtype.
+        delimiter (str): Delimiter
 
     Returns:
         pd.Series: A Series containing a new categorical variable that represents 
@@ -374,6 +375,53 @@ def combine_cat(df):
     return pd.Series(
         pd.Categorical.from_codes(
             df.apply(lambda x: x.cat.codes).dot(df.nunique().shift(1).fillna(1).astype('int').cumprod()), 
-            [''.join(i) for i in product(*df.apply(lambda x: x.cat.categories.astype('str').tolist(), result_type='reduce'))]
+            [delimiter.join(i) for i in product(*df.apply(lambda x: x.cat.categories.astype('str').tolist(), result_type='reduce'))]
         ), index=df.index
     )
+
+def replace_cat(s, rule):
+    """
+    Replaces the categories in a pandas Categorical Series based on a given rule.
+
+    Args:
+        s (pd.Series): A pandas Series with categorical dtype (i.e., `pd.Categorical`).
+        rule (Union[Dict[str, str], Callable[[str], str]]): A mapping or function that defines the 
+            new category replacements.
+            - If `rule` is a dictionary, the keys are the original categories and the values are the 
+              replacements.
+            - If `rule` is a function, it takes an original category and returns the new category.
+
+    Returns:
+        pd.Series: A new pandas Categorical object with the categories replaced 
+        according to the given rule.
+
+    Example:
+        >>> s = pd.Series(['a', 'b', 'c'], dtype='category')
+        >>> rule = {'a': 'x', 'b': 'x'}
+        >>> replace_cat(s, rule)
+        [x, x, c]
+        Categories (2, object): [x, c]
+
+        Or using a function:
+
+        >>> rule = lambda x: x.upper()
+        >>> replace_cat(s, rule)
+        [A, B, C]
+        Categories (3, object): [A, B, C]
+
+    """
+    code_replace = {}
+    d = {}
+    for c, n in zip(
+        range(len(s.cat.categories)), 
+        s.cat.categories
+    ):
+        new_cat = rule.get(n, n) if type(rule) == dict else rule(n)
+        if new_cat in code_replace:
+            d[c] = code_replace[new_cat]
+        else:
+            d[c] = len(code_replace)
+            code_replace[new_cat] = len(code_replace)
+    return pd.Categorical.from_codes(
+            s.cat.codes.map(d), list(code_replace.keys())
+        )
