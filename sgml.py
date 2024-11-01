@@ -5,6 +5,10 @@ import numpy as np
 import pandas as pd
 import gc
 
+try:
+    from tqdm.notebook import tqdm
+except:
+    from tqdm import tqdm
 
 def gb_valid_config(train_set, valid_set):
     return {}, {'eval_set': [train_set, valid_set] if valid_set is not None else [train_set]}
@@ -21,7 +25,31 @@ def pass_learning_result(m, train_result, preprocessor=None):
     else:
         return make_pipeline(preprocessor, m), train_result
 
+def m_learning_result(m, train_result):
+    return m, train_result
+
 def lgb_learning_result(m, train_result, preprocessor=None):
+    """
+    Process LightGBM model results to extract evaluation metrics and feature importances.
+
+    This function extracts and formats the training evaluation metrics and feature importances 
+    from a trained LightGBM model.
+
+    Parameters:
+        m (lightgbm.Booster or lightgbm.sklearn.LGBMModel): 
+            The trained LightGBM model object that contains the evaluation results and feature importances.
+        train_result (dict): 
+            A dictionary containing training-related information, including the names of the features used.
+        preprocessor (object, optional): 
+            A preprocessing object if used in the model pipeline (not utilized in this function, but included for consistency).
+
+    Returns:
+        tuple: A tuple containing:
+            - pd.DataFrame or None: A DataFrame containing evaluation metrics for each dataset and metric, indexed by iteration. 
+              If no evaluation results are present, returns None.
+            - pd.Series: A Series of feature importances sorted in ascending order, indexed by feature names.
+            - dict: The original `train_result` dictionary.
+    """
     return (
         pd.concat([
             pd.DataFrame(
@@ -71,6 +99,154 @@ def sgnn_learning_result(m, train_result, preprocessor=None):
         pd.DataFrame(m.history_),
         train_result
     )
+
+
+class LGBMFitProgressbar:
+    def __init__(self, precision = 5, start_position=0, metric=None, greater_is_better = True):
+        self.start_position = start_position
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.metric = metric
+        self.metric_hist = list()
+        self.greater_is_better = greater_is_better
+
+    def __repr__(self):
+        return 'LGBMFitProgressbar'
+    
+    def _init(self, env):
+        self.total_iteration = env.end_iteration - env.begin_iteration
+        self.progress_bar = tqdm(total=self.total_iteration, desc='Round', position=self.start_position, leave=False)
+
+    def __call__(self, env):
+        if env.iteration == env.begin_iteration:
+            self._init(env)
+        self.progress_bar.update(1)
+        if env.evaluation_result_list is not None:
+            results = list()
+            for item in env.evaluation_result_list:
+                if len(item) >= 3:
+                    data_name, eval_name, result = item[:3]
+                    results.append(
+                        '{}_{}:{}'.format(data_name, eval_name, self.fmt.format(result))
+                    )
+                    if self.metric == '{}_{}'.format(data_name, eval_name):
+                        self.metric_hist.append(result)
+            if self.metric is not None:
+                if self.greater_is_better:
+                    results.append(
+                        'Best {}: {}/{}'.format(self.metric, np.argmax(self.metric_hist) + 1, self.fmt.format(np.max(self.metric_hist)))
+                    )
+                else:
+                    results.append(
+                        'Best {}: {}/{}'.format(self.metric, np.argmin(self.metric_hist) + 1, self.fmt.format(np.min(self.metric_hist)))
+                    )
+            self.progress_bar.set_postfix_str(', '.join(results))
+        if self.total_iteration - 1 == env.iteration - env.begin_iteration:
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+
+try:
+    import xgboost as xgb
+    class XGBFitProgressbar(xgb.callback.TrainingCallback):
+        def __init__(self, n_estimators, precision=5, start_position=0, metric=None, greater_is_better=True):
+            self.start_position = start_position
+            self.n_estimators = n_estimators
+            self.fmt = '{:.' + str(precision) + 'f}'
+            self.metric = metric
+            self.metric_hist = []
+            self.greater_is_better = greater_is_better
+            self.progress_bar = None
+        
+        def __repr__(self):
+            return 'XGBFitProgressbar'
+        
+        def before_training(self, model):
+            self.progress_bar = tqdm(total=self.n_estimators, desc='Round', position=self.start_position, leave=False)
+            return model
+    
+        def after_iteration(self, model, epoch, evals_log):
+            # 진행 상태를 업데이트
+            self.progress_bar.update(1)
+    
+            results = []
+            for data_name, metrics in evals_log.items():
+                for eval_name, eval_results in metrics.items():
+                    result = eval_results[-1]
+                    results.append(f'{data_name}_{eval_name}:{self.fmt.format(result)}')
+                    if self.metric == f'{data_name}_{eval_name}':
+                        self.metric_hist.append(result)
+    
+            if self.metric is not None and self.metric_hist:
+                if self.greater_is_better:
+                    best_round = np.argmax(self.metric_hist) + 1
+                    best_value = np.max(self.metric_hist)
+                else:
+                    best_round = np.argmin(self.metric_hist) + 1
+                    best_value = np.min(self.metric_hist)
+    
+                results.append(f'Best {self.metric}: {best_round}/{self.fmt.format(best_value)}')
+    
+            self.progress_bar.set_postfix_str(', '.join(results))
+    
+            # False를 반환하면 학습이 계속 진행됨
+            return False
+    
+        def after_training(self, model):
+            # 학습이 종료되면 진행바를 닫음
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+            return model
+except:
+    pass
+
+class CatBoostFitProgressbar:
+    def __init__(self, n_estimators, precision=5, start_position=0, metric=None, greater_is_better=True):
+        self.start_position = start_position
+        self.n_estimators = n_estimators
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.metric = metric
+        self.metric_hist = list()
+        self.greater_is_better = greater_is_better
+        self.progress_bar = None
+    
+    def __repr__(self):
+            return 'CatBoostFitProgressbar'
+    
+    def after_iteration(self, info):
+        if self.progress_bar is None:
+            self.progress_bar = tqdm(total=self.n_estimators, desc='Round', position=self.start_position, leave=False)
+
+        self.progress_bar.update(1)
+        results = list()
+        if info.metrics is not None:
+            for k, v in info.metrics.items():
+                results_2 = list()
+                for k2, v2 in v.items():
+                    results_2.append('{}: {}'.format(k2, self.fmt.format(v2[-1])))
+                    if self.metric == f'{k}_{k2}':
+                        self.metric_hist.append(v2[-1])
+                results.append('{}: {}'.format(k, ', '.join(results_2)))
+
+        if self.metric is not None and self.metric_hist and len(self.metric_hist) > 0:
+            if self.greater_is_better:
+                best_round = np.argmax(self.metric_hist) + 1
+                best_value = np.max(self.metric_hist)
+            else:
+                best_round = np.argmin(self.metric_hist) + 1
+                best_value = np.min(self.metric_hist)
+
+            results.append(f'Best {self.metric}: {best_round}/{self.fmt.format(best_value)}')
+        
+        self.progress_bar.set_postfix_str(', '.join(results))
+        return True
+
+    def after_train(self):
+        if self.progress_bar is not None:
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+
 
 def train_model(model, model_params, df_train, X, y, valid_splitter=None, preprocessor=None, fit_params={}, valid_config_proc = None, target_func=None):
     """
@@ -155,8 +331,42 @@ def train_model(model, model_params, df_train, X, y, valid_splitter=None, prepro
         m = make_pipeline(preprocessor, m)
     return m, result
 
-def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, sp_y=None, target_func=None, target_invfunc=None):
+class BaseCallBack:
+    def start(self, n_splits):
+        pass
+    def start_fold(self, fold):
+        pass
+    def end_fold(self, fold, train_metrics, valid_metrics, model_result_cv):
+        pass
+    def end(self):
+        pass
+
+class ProgressCallBack(BaseCallBack):
+    def __init__(self, precision=5, start_position=0):
+        self.start_position = start_position
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.progress_bar = None
+    
+    def start(self, n_splits):
+        self.progress_bar = tqdm(total=n_splits, desc='Fold', position=self.start_position, leave=False)
+    
+    def end_fold(self, fold, train_metrics, valid_metrics, model_result_cv):
+        self.progress_bar.update(1)
+        results = list()
+        if len(train_metrics) > 0:
+            results.append(
+                '{}±{}'.format(self.fmt.format(np.mean(train_metrics)), self.fmt.format(np.std(train_metrics)))
+            )
+        results.append(
+            '{}±{}'.format(self.fmt.format(np.mean(valid_metrics)), self.fmt.format(np.std(valid_metrics)))
+        )
+        self.progress_bar.set_postfix_str(', '.join(results))
+    def end(self):
+        self.progress_bar.close()
+
+def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric, return_train_scores = True,
+            preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, sp_y=None, groups=None, 
+            target_func=None, target_invfunc=None, progress_callback=None):
     """
     Train a model
     Parameters:
@@ -176,12 +386,18 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
             prediction function
         eval_metric: function
             score functiongb_valid_config
+        return_train_scores: bool
+            return train scores
         preprocessor: sklearn.preprocessing. 
             preprocessor. it will be connected using make_pipeline
         fit_params: dict
             parameters for fit
         sp_y: str
             splitter y value name
+        target_func: function
+            function to transform the target
+        target_inv_func: function
+            inverse function to transform the predicted target
     Returns
         list, list, Series, list
         train_metrics, valid_metrics, s_prd, model_result_cv
@@ -210,17 +426,24 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
     if sp_y is None:
         sp_y = y
     model_result_cv = list()
-    for train_idx, valid_idx in sp.split(df[X], df[sp_y]):
+    sp_params = {'X': df[X], 'y': df[sp_y], 'groups': None if groups is None else df[groups]}
+    if progress_callback is None:
+        progress_callback = BaseCallBack()
+    progress_callback.start(sp.get_n_splits(**sp_params))
+    for fold, (train_idx, valid_idx) in enumerate(sp.split(**sp_params)):
+        progress_callback.start_fold(fold)
         df_cv_train, df_valid = df.iloc[train_idx], df.iloc[valid_idx]
         if train_data_proc != None:
             df_cv_train = train_data_proc(df_cv_train)
         m, train_result = train_model(model, model_params, df_cv_train, X, y, preprocessor=preprocessor, target_func=target_func, **train_params)
         if target_invfunc is None:
             valid_prds.append(predict_func(m, df_valid, X))
-            train_metrics.append(eval_metric(df_cv_train, predict_func(m, df_cv_train, X)))
+            if return_train_scores:
+                train_metrics.append(eval_metric(df_cv_train, predict_func(m, df_cv_train, X)))
         else:
             valid_prds.append(target_invfunc(df_valid, predict_func(m, df_valid, X)))
-            train_metrics.append(eval_metric(df_cv_train, target_invfunc(df_cv_train, predict_func(m, df_cv_train, X))))
+            if return_train_scores:
+                train_metrics.append(eval_metric(df_cv_train, target_invfunc(df_cv_train, predict_func(m, df_cv_train, X))))
         valid_metrics.append(eval_metric(df_valid, valid_prds[-1]))
         if result_proc is not None:
             if preprocessor is None:
@@ -228,27 +451,40 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
             else:
                 train_result = result_proc(m[-1], train_result, m[0])
         model_result_cv.append(train_result)
+        progress_callback.end_fold(fold, train_metrics, valid_metrics, model_result_cv)
     s_prd = pd.concat(valid_prds, axis=0)
+    progress_callback.end()
     return train_metrics, valid_metrics, s_prd, model_result_cv
 
 class SGStacking:
-    def __init__(self, df_train, target, sp, predict_func, eval_metric, greater_better=True, sp_y=None):
+    """
+    Stacking ensemble model class with support for cross-validation and model selection.
+
+    Attributes:
+        df_train (pd.DataFrame): Training dataset.
+        target (str): Target column name.
+        sp (Splitter): sklearn compatible splitter object.
+        predict_func (function): Function to extract predictions from a model.
+        eval_metric (function): Evaluation metric function.
+        greater_better (bool): Whether greater evaluation metric values are better.
+        sp_y (str): Column name for target variable in the splitter, default is the target.
+        groups (Optional): Groups for the splitter, if any.
+        return_train_scores (bool): Whether to return training scores or not.
+    """
+    def __init__(self, df_train, target, sp, predict_func, eval_metric, greater_better=True, sp_y=None, groups=None, return_train_scores = True):
         """
-        Parameters
-            df_train: pd.DataFrame
-                training data
-            target: str
-                target value name
-            sp: Splitter
-                sklearn spliiter object
-            predict_func: function
-                extract prediction result from model
-            eval_metric: function
-                evaluation metric function
-            greater_better: Boolean
-                True: the greater, the better False: the greater, the worse
-            sp_y: str
-                value name for splitter target, if None target value used
+        Initialize the SGStacking class.
+
+        Args:
+            df_train (pd.DataFrame): Training dataset.
+            target (str): Target column name.
+            sp (Splitter): sklearn compatible splitter object.
+            predict_func (function): Function to extract predictions from a model.
+            eval_metric (function): Evaluation metric function.
+            greater_better (bool): Whether greater evaluation metric values are better.
+            sp_y (str, optional): Column name for target variable in the splitter, default is the target.
+            groups (Optional): Groups for the splitter, if any.
+            return_train_scores (bool, optional): Whether to return training scores or not.
         Examples
         >>> cv5 = StratifiedKFold(n_splits=5, random_state=123, shuffle=True)
         >>> def predict(m, df_valid, X):
@@ -268,29 +504,23 @@ class SGStacking:
         self.meta_model = None
         self.meta_X = None
         self.sp_y = sp_y
+        self.groups = groups
+        self.return_train_scores = return_train_scores
 
     def get_result(self, model_name, model, preprocessor, model_param, X, target_func):
         """
-        get the results of the model
+        Retrieve the result of a trained model if it exists.
+
         Parameters:
-            model_name: str
-                model name
-            model: Class
-                Class of model
-            preprocessor: object
-                sklearn preprocessor object
-            model_param: dict
-                model parameter
-            X: list
-                list of variable names
+            model_name (str): Name of the model.
+            model (object): Model class.
+            preprocessor (object): Preprocessor object.
+            model_param (dict): Model parameters.
+            X (list): List of input feature names.
+            target_func (function, optional): Target transformation function.
+
         Returns:
-            dict
-            {
-                'model': model list
-                'model param': the parameters of model
-                'train_metrics': the metrics of train
-                'valid_metrics': the metrics of validation
-            }
+            dict or None: Dictionary with the model's training and validation metrics, or None if not found.
         """
         if model_name in self.model_result:
             result_ = self.model_result[model_name]
@@ -322,7 +552,7 @@ class SGStacking:
                 if result_['best_result'] is None or \
                     (self.greater_better and metric >= np.max(result_['metric'])) or \
                     (not self.greater_better and metric <= np.min(result_['metric'])):
-                    result_['best_result'] = (s_prd, model_result_cv, target_invfunc)
+                    result_['best_result'] = (s_prd.sort_index().values, model_result_cv, target_invfunc)
                     if model_name in self.selected_models:
                         del self.selected_models[model_name]
                 result_['metric'][idx] = metric
@@ -352,16 +582,20 @@ class SGStacking:
         if result_['best_result'] is None or \
             (self.greater_better and metric >= np.max(result_['metric'])) or \
             (not self.greater_better and metric <= np.min(result_['metric'])):
-            result_['best_result'] = (s_prd, model_result_cv, target_func, target_invfunc)
+            result_['best_result'] = (s_prd.sort_index().values, model_result_cv, target_func, target_invfunc)
             if model_name in self.selected_models:
                 del self.selected_models[model_name]
         result_['metric'].append(metric)
 
     def append_vars(self, pd_vars):
         """
-        Append varaibles to train data
+        Append additional variables to the training dataset.
+
         Parameters:
-            pd_vars: pd.DataFrame or pd.Series
+            pd_vars (pd.DataFrame or pd.Series): Variables to append.
+
+        Raises:
+            Exception: If the indices of `pd_vars` do not match the existing training data indices.
         """
         if (pd_vars.index == self.df_train.index).all():
             if type(pd_vars) == pd.Series and pd_vars.name in self.df_train.columns:
@@ -380,7 +614,10 @@ class SGStacking:
     
     def compact_result(self, model_name):
         """
-        Store only the result of best trial
+        Store only the best trial results for a given model.
+
+        Parameters:
+            model_name (str): Name of the model to compact results for.
         """
         result_new_ = {
             'model_key': [],
@@ -411,6 +648,15 @@ class SGStacking:
         del self.model_result[model_name]
     
     def get_best_results(self, model_names):
+        """
+        Get the best results for the specified models.
+
+        Parameters:
+            model_names (list of str): List of model names.
+
+        Returns:
+            pd.DataFrame: DataFrame with the best results for each model.
+        """
         tmp = list()
         for model_name in model_names:
             result_ = self.model_result[model_name]
@@ -430,7 +676,7 @@ class SGStacking:
         return pd.DataFrame(tmp).assign(
             model = lambda x: x['model'].apply(lambda x: str(x).split('.')[-1][:-2]),
             X = lambda x: x['X'].apply(lambda x: ','.join(x)),
-            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
+            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x)) if self.return_train_scores else ''),
             valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
         )
 
@@ -449,35 +695,27 @@ class SGStacking:
         return result_['best_result'][0]
     
     def eval_model(self, model_name, model, model_params, X,  
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, target_func=None, target_invfunc=None, rerun=False):
+                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, target_func=None, target_invfunc=None, rerun=False, progress_callback=None):
         """
-        Evaluate a base model and store the result.
+        Evaluate a base model with cross-validation and store the results.
+
         Parameters:
-            model_name: str
-                모델명
-            model: Class
-                Model class
-            model_param: dict
-                Model hyper parameters
-            X: list
-                input variable names
-            preprocessor: sklearn.preprocessing. 
-                preprocessor. it will be connected using make_pipeline
-            result_proc: function
-                the processor for the result of training 
-            train_data_proc: function
-                the processor for traing data
-            train_params: dict
-                the parameter for train_model
-            target_func: function
-                the target transform function
-            target_invfunc: function
-                the target inverse transform function
-            rerun: Boolean
-                Rerun
-        Returns
-            object, dict
-            model information, train result 
+            model_name (str): Name of the model.
+            model (Class): Model class.
+            model_params (dict): Hyperparameters for the model.
+            X (list): List of feature names.
+            preprocessor (optional): Preprocessor object.
+            result_proc (function, optional): Function to process the training results.
+            train_data_proc (function, optional): Function to process the training data.
+            train_params (dict, optional): Training parameters.
+            target_func (function, optional): Target transformation function.
+            target_invfunc (function, optional): Inverse target transformation function.
+            rerun (bool, optional): Whether to rerun the evaluation.
+            progress_callback (optional): Progress callback object.
+
+        Returns:
+            object, dict: Trained model information and training result dictionary.
+        
         Example
         >>> lgb_result, train_result = stk.eval_model(
         >>>    'lgb_1', lgb.LGBMRegressor, {'verbose': -1, 'n_estimators': 140}, X_all,
@@ -495,9 +733,9 @@ class SGStacking:
                 return result, None
         train_metrics, valid_metrics, s_prd, model_result_cv = \
             cv_model(
-                self.sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric,
+                self.sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric, groups=self.groups, return_train_scores = self.return_train_scores,
                 preprocessor=preprocessor, result_proc=result_proc, train_data_proc=train_data_proc, train_params=train_params, sp_y=self.sp_y,
-                target_func=target_func, target_invfunc=target_invfunc
+                target_func=target_func, target_invfunc=target_invfunc, progress_callback=progress_callback
             )
         train_info = {
             'result_proc': result_proc, 'train_data_proc': train_data_proc, 'train_params': train_params
@@ -506,7 +744,7 @@ class SGStacking:
         return self.get_result(model_name, model, preprocessor, model_params, X, target_func), model_result_cv
 
     def eval_model_cv(self, sp, model, model_params, X,  
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, target_func=None, target_invfunc=None):
+                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, target_func=None, target_invfunc=None, progress_callback=None):
         """
         eval model with givem splitter
         Parameters:
@@ -532,15 +770,17 @@ class SGStacking:
                 the target inverse transform function
             rerun: Boolean
                 Rerun
+            progress_callback: BaseCallBack
+                progress callback
         Returns
             object, dict
             model information, train result
         """
         train_metrics, valid_metrics, s_prd, model_result_cv = \
             cv_model(
-                sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric,
+                sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric, return_train_scores = self.return_train_scores,
                 preprocessor=preprocessor, result_proc=result_proc, train_data_proc=train_data_proc, train_params=train_params, sp_y=self.sp_y,
-                target_func=target_func, target_invfunc=target_invfunc
+                target_func=target_func, target_invfunc=target_invfunc, progress_callback=None
             )
         return {
                 'model': model,
@@ -564,7 +804,7 @@ class SGStacking:
         return pd.DataFrame(tmp).assign(
             model = lambda x: x['model'].apply(lambda x: str(x).split('.')[-1][:-2]),
             X = lambda x: x['X'].apply(lambda x: ','.join(x)),
-            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
+            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x)) if self.return_train_scores else ''),
             valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
         )
         
@@ -572,8 +812,8 @@ class SGStacking:
         """
         Select the model and fit the model with the best parameter for base model. And store the model instance and cv prediction of the model.
         Parameters:
-            model_name: str
-                모델명
+            model_name (str): Name of the model to select.
+            rerun (bool, optional): Whether to rerun the selection.
         Returns:
             object, dict, float
             model instance, train result, train metric
@@ -656,9 +896,12 @@ class SGStacking:
         vals = [self.target] + inc_vals
         if self.sp_y is not None:
             vals.append(self.sp_y)
-        df = pd.concat([
-                self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [self.df_train[vals]], axis=1).sort_index()
+        df = pd.DataFrame(
+            np.stack([self.model_result[i]['best_result'][0] for i in model_names], axis=1), 
+            index=self.df_train.index.sort_values(), columns= model_names
+        ).join(
+            self.df_train[vals]
+        )
         train_metrics, valid_metrics, s_prd, model_result_cv = cv_model(
             self.sp, model, model_params, df, model_names, self.target, self.predict_func, self.eval_metric, 
             result_proc=result_proc, train_params=train_params, sp_y=self.sp_y
@@ -701,13 +944,13 @@ class SGStacking:
     
     def predict(self, df):
         """
-        predict with stacking model
-        Parameters:
-            df: pd.DataFrame
-                input dataframe
+        Make predictions using the stacking model.
+
+        Args:
+            df (pd.DataFrame): Input dataframe for predictions.
+
         Returns:
-            ndarray
-                result of prediction
+            ndarray: Prediction results.
         """
         prds = list()
         for m_ in self.meta_X:
@@ -753,7 +996,8 @@ class SGStacking:
             'greater_better': self.greater_better,
             'meta_model': self.meta_model,
             'meta_X': self.meta_X,
-            'sp_y': self.sp_y
+            'sp_y': self.sp_y,
+            'groups': self.groups
         }
         with open(file_name, 'wb') as f:
             pkl.dump(model_contents, f)
@@ -770,7 +1014,8 @@ class SGStacking:
         stk = SGStacking(
             model_contents['df_train'], model_contents['target'],
             model_contents['splitter'], model_contents['predict_func'], model_contents['eval_metric'], model_contents['greater_better'],
-            sp_y = model_contents['sp_y']
+            sp_y = model_contents['sp_y'],
+            groups = model_contents['groups']
         )
         stk.model_result = model_contents['model_result']
         stk.selected_models = model_contents['selected_models']
