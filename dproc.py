@@ -24,16 +24,21 @@ def get_type_df(df):
         ('count', cs.all().count()),
         ('n_unique', cs.all().n_unique()),
     ]
-
     df_type = df.select(
         **{k: pl.struct(v) for k, v in stat}
     ).melt().unnest('value').rename({'variable': 'stat'})\
     .melt(id_vars='stat', variable_name='feature')
     if type(df_type) == pl.LazyFrame:
         df_type = df_type.collect()
+    if type(df) == pl.lazyframe.frame.LazyFrame:
+        dtypes = df.collect_schema().dtypes()
+        columns = df.collect_schema().names()
+    else:
+        dtypes = df.dtypes
+        columns = df.columns
     df_type = df_type.pivot(index='feature', columns='stat', values='value')\
                 .to_pandas().set_index('feature').join(
-                    pd.Series([str(i) for i in df.dtypes], index=df.columns, name='dtype')
+                    pd.Series([str(i) for i in dtypes], index=columns, name='dtype')
                 )
     for i, mn, mx in [
         ('f32', np.finfo(np.float32).min, np.finfo(np.float32).max),
@@ -535,6 +540,6 @@ def rearrange_cat(s_cat, cat_type, repl_rule):
         lambda x: s_map[x] if x in s_map else repl_rule(cat_vals, x)
     )
     
-    return pd.Categorical.from_codes(
-        s_cat.map(s_cat_map), cat_vals, ordered=cat_type.ordered
+    return s_cat.loc[s_cat.notna()].pipe(
+        lambda x: pd.Series(pd.Categorical.from_codes(x.map(s_cat_map), cat_vals), index=x.index)
     )
