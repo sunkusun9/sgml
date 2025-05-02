@@ -1,8 +1,11 @@
+import os
 import pandas as pd
 import numpy as np
 import polars as pl
 import polars.selectors as cs
 from functools import partial
+from itertools import product
+from collections import OrderedDict
 
 def get_type_df(df):
     """
@@ -23,17 +26,25 @@ def get_type_df(df):
         ('count', cs.all().count()),
         ('n_unique', cs.all().n_unique()),
     ]
-
     df_type = df.select(
         **{k: pl.struct(v) for k, v in stat}
     ).melt().unnest('value').rename({'variable': 'stat'})\
     .melt(id_vars='stat', variable_name='feature')
     if type(df_type) == pl.LazyFrame:
         df_type = df_type.collect()
-    df_type = df_type.pivot(index='feature', columns='stat', values='value')\
-                .to_pandas().set_index('feature').join(
-                    pd.Series([str(i) for i in df.dtypes], index=df.columns, name='dtype')
-                )
+    if type(df) == pl.lazyframe.frame.LazyFrame:
+        dtypes = df.collect_schema().dtypes()
+        columns = df.collect_schema().names()
+    else:
+        dtypes = df.dtypes
+        columns = df.columns
+    df_type = df_type.pivot(
+        index='feature', columns='stat', values='value'
+    ).to_pandas().assign(
+        feature = lambda x: x['feature'].astype(str)
+    ).set_index('feature').join(
+        pd.Series([str(i) for i in dtypes], index=columns, name='dtype')
+    )
     for i, mn, mx in [
         ('f32', np.finfo(np.float32).min, np.finfo(np.float32).max),
         ('i32', np.iinfo(np.int32).min, np.iinfo(np.int32).max),
@@ -44,6 +55,85 @@ def get_type_df(df):
             lambda x: (x['min'] >= mn) and (x['max'] <= mx), axis=1
         )
     return df_type
+
+def get_type_vars(var_list):
+    """
+    Processes a list of variables and generates a DataFrame summarizing their properties, such as 
+    the number of unique values, count, and range (min, max). Also checks whether numeric variables 
+    fit within certain data type ranges (e.g., float32, int32, int16, int8).
+
+    Args:
+        var_list (list of tuples): A list of tuples where each tuple contains the following elements:
+            - src (str): The source or origin of the variable.
+            - s (pd.Series): The pandas Series representing the variable.
+            - desc (str): A description of the variable (unused in the function).
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame indexed by variable name with the following columns:
+            - 'src' (str): The source of the variable.
+            - 'dtype' (str): The data type of the variable.
+            - 'na' (int): The number of missing values in the variable.
+            - 'n_unique' (int): The number of unique values in the variable.
+            - 'count' (int): The total count of non-missing values.
+            - 'min' (varied): The minimum value of the variable (if applicable).
+            - 'max' (varied): The maximum value of the variable (if applicable).
+            - 'f32' (bool): Whether the variable can fit within a float32 data type range.
+            - 'i32' (bool): Whether the variable can fit within an int32 data type range.
+            - 'i16' (bool): Whether the variable can fit within an int16 data type range.
+            - 'i8' (bool): Whether the variable can fit within an int8 data type range.
+
+    Example:
+        >>> var_list = [
+        ...     ('source1', pd.Series([1, 2, 3], dtype='int32'), 'description1', 'Numeric'),
+        ...     ('source2', pd.Series(['a', 'b', 'a'], dtype='category'), 'description2', 'Categorical')
+        ... ]
+        >>> get_type_vars(var_list)
+        # Returns a DataFrame with statistics on the variables, including dtype compatibility.
+    """
+    s_list = list()
+    for src, s, desc in var_list:
+        if str(s.dtype) == 'category':
+            t = 'Categorical'
+            if s.dtype.ordered:
+                s_list.append(
+                    pd.Series(
+                        [src, s.name, desc, t, s.isna().sum()] + s.agg(['nunique', 'count', 'min', 'max']).tolist(),
+                        index=['src', 'var', 'Description', 'dtype', 'na', 'n_unique', 'count', 'min', 'max']
+                    )
+                )
+            else:
+                s_list.append(
+                    pd.Series(
+                        [src, s.name, desc, t, s.isna().sum()] + s.agg(['nunique', 'count']).tolist(),
+                        index=['src', 'var', 'Description', 'dtype', 'na', 'n_unique', 'count']
+                    )
+                )
+        else:
+            t = str(s.dtype)
+            if t == 'str':
+                t = 'String'
+            if t == 'datetime64[ns]':
+                t = 'Datetime'
+            else:
+                t = t[:1].upper() + t[1:]
+            s_list.append(
+                pd.Series(
+                    [src, s.name, desc, s.isna().sum(), t] + s.agg(['nunique', 'count', 'min', 'max']).tolist(),
+                    index=['src', 'var', 'Description', 'na', 'dtype', 'n_unique', 'count', 'min', 'max']
+                )
+            )
+    df = pd.DataFrame(s_list).set_index('var')
+    if 'min' in df.columns:
+        for i, mn, mx in [
+            ('f32', np.finfo(np.float32).min, np.finfo(np.float32).max),
+            ('i32', np.iinfo(np.int32).min, np.iinfo(np.int32).max),
+            ('i16', np.iinfo(np.int16).min, np.iinfo(np.int16).max),
+            ('i8', np.iinfo(np.int8).min, np.iinfo(np.int8).max)
+        ]:
+            df[i] = df.loc[~df['dtype'].isin(['String', 'Categorical', 'Datetime'])].apply(
+                lambda x: (x['min'] >= mn) and (x['max'] <= mx), axis=1
+            )
+    return df
 
 def merge_type_df(dfs):
     """
@@ -73,7 +163,7 @@ def get_type_pl(df_type, predefine={}, f32=True, i64=False, cat_max=np.inf, txt_
         i64: Boolean
             use i64 for all integer types
         cat_max: Int
-            maximum category number for categorical types
+            maximum number of categories for categorical types
         txt_cols: list
             Text type columns
     Returns:
@@ -156,203 +246,145 @@ def get_type_pd(df_type, predefine={}, f32=True, i64=False, cat_max=np.inf, txt_
     for i in df_type.loc[~df_type.index.isin(ret_type)].index:
         ret_type[i] = 'string'
     return ret_type
+  
+def join_and_assign(df1, df2):
+    """
+    Joins columns from the first DataFrame to the second DataFrame if they do not already exist in the second DataFrame.
 
-def with_columns_opr(dfl, proc_list, df_feat=None):
-    """
-    pl.with_column processing
-    Parameters:
-        dfl: pl.DataFrame
-            Data DataFrame to process
-        proc_list: list
-            (src, variable name, pl.Expr, Description)
-        df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not make feature information
-    Returns:
-        pl.DataFrame, pd.Dataframe
-            Data DataFrame, Feature DataFrame
-    Examples:
-        >>> target_assign = [
-        >>>    ('targetproc1', 'target', (pl.col('Rings') + 1).log().cast(pl.Float32), "RMSLE 지표를 최적화하기 위한 Rings의 log1p 변환을 하여 target을 만듭니다."),
-        >>> ]
-        >>> dfl_train, df_feature = with_column_opr(dfl_train, target_assign, df_feature)
-        >>> dfl_org, _ = with_column_opr(dfl_org, target_assign)
-    """
-    df_proc = pd.DataFrame(proc_list, columns=['src', 'val', 'proc', 'Description']).set_index('val')
-    dfl = dfl.with_columns(**df_proc['proc'])
-    if df_feat is not None:
-        df_feat = pd.concat([
-            df_proc[['src', 'Description']], 
-            pd.Series([str(i) for i in dfl[df_proc.index.tolist()].dtypes], index=df_proc.index, name='type')
-        ], axis=1).pipe(
-            lambda x: pd.concat([df_feat, x], axis=0)
-        )
-    return dfl, df_feat
+    Args:
+        df1 (pd.DataFrame): The source DataFrame containing columns to merge.
+        df2 (pd.DataFrame): The target DataFrame to which columns from `df1` will be joined if not present.
 
-def apply_processor(dfl, processor, X_val, info_prov, df_feat=None):
-    """
-    sklearn.preprocessing processing
-    Parameters:
-        dfl: pl.DataFrame
-            Data DataFrame to process
-        processor: object
-            Sklearn Preprocessor object
-        X_val: list
-            Proprocessign target variable names
-        info_prov: Function
-            The function provide columns information
-        df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not make feature information
     Returns:
-        pl.DataFrame, pd.Dataframe
-            Data DataFrame, Feature DataFrame
-    Examples:
-        >>> X_std = df_feature.query('src == "origin" and type == "Float32"').index.to_series().replace({'Height': 'Height_n'}).tolist()
-        >>> pipe_std_pca = make_pipeline(
-        >>>     StandardScaler(), 
-        >>>     ColumnTransformer([
-        >>>         ('std', 'passthrough', np.arange(len(X_std)).tolist()), 
-        >>>         ('pca', PCA(n_components=4), np.arange(len(X_std)).tolist())
-        >>>     ])
-        >>> )
-        >>> def info_prov(p, v):
-        >>>     if p == 'pca':
-        >>>         return ('pca', v, 'Size features PCA component ' + v, pl.Float32)
-        >>>     return ('std', v, 'StandardScaler: ' + v, pl.Float32)
-        >>> dfl = apply_processor(dfl, processor=pipe_std_pca, X_val=X_std, info_prov=info_prov, df_feat = df_feature)
+        pd.DataFrame: The resulting DataFrame with `df1`'s columns added to `df2` where they were missing.
     """
-    entity = list()
-    if df_feat is not None:
-        processor.fit(dfl[X_val])
-    for i in processor.get_feature_names_out():
-        sp = i.split('__')
-        if len(sp) > 1: 
-            p, v = sp[0], sp[1]
-        else:
-            p, v = sp[0], ''
-        entity.append(info_prov(p, v))
-    df_feat_ = pd.DataFrame(entity, columns=['src', 'val', 'Description', 'dt']).set_index('val')
-    dfl_proc = pl.DataFrame(
-        processor.transform(dfl.select(cs.by_name(X_val))),
-        schema = df_feat_['dt'].to_dict()
+    to_merge = [i for i in df1.columns if i not in df2.columns]
+    if len(to_merge) == 0: return df2.copy()
+    return df1[to_merge].join(df2)
+
+def combine_cat(df, delimiter=''):
+    """
+    Combines multiple categorical columns in a DataFrame into a single categorical variable, in efficient way. 
+
+    Parameters:
+        df (pd.DataFrame): DataFrame where each column is of categorical dtype.
+        delimiter (str): Delimiter
+
+    Returns:
+        pd.Series: A Series containing a new categorical variable that represents 
+                   the unique combination of all input categorical columns.
+    """
+    return pd.Series(
+        pd.Categorical.from_codes(
+            df.apply(lambda x: x.cat.codes).dot(df.nunique().shift(1).fillna(1).astype('int').cumprod()), 
+            [delimiter.join(i[::-1]) for i in product(*df[df.columns[::-1]].apply(lambda x: x.cat.categories.astype('str').tolist(), result_type='reduce'))]
+        ), index=df.index
     )
-    if df_feat is not None:
-        df_feat_ = df_feat_.drop(columns=['dt']).join(pd.Series([str(i) for i in dfl_proc.dtypes], index=df_feat_.index.tolist(), name='type'))
-        df_feat = pd.concat([df_feat, df_feat_], axis=0)
-    d = []
-    for i in dfl_proc.columns:
-        if i in dfl.columns:
-            d.append(dfl_proc.drop_in_place(i))
-    dfl = dfl.with_columns(*d)
-    return dfl.hstack(dfl_proc), df_feat
 
-def select_opr(dfl, select_proc, desc, src, df_feat=None):
+def replace_cat(s, rule):
     """
-    apply select_proc
-    Parameters:
-        dfl: pl.DataFrame
-            Data DataFrame to process
-        processor: Function
-            dfl proccesing function
-        X_val: list
-            Proprocessign target variable names
-        desc: Function
-            The function provide columns information
-        src: str
-            The name of source
-        df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not make feature information
-    Returns:
-        pl.DataFrame, pd.Dataframe
-            Data DataFrame, Feature DataFrame
-    Examples:
-        >>> dfl_merge = dfl_merge.sort('pca0')
-        >>> sig = 1.96
-        >>> clip_target = lambda x: x.select(
-        >>>             pl.col('target'),
-        >>>         ).with_columns(
-        >>>             pl.col('target').rolling_mean(101, center=True, min_periods=50).alias('mean_'),
-        >>>             pl.col('target').rolling_std(101, center=True, min_periods=50).alias('std_')
-        >>>         ).select(
-        >>>             pl.col('target').clip(
-        >>>                 pl.col('mean_') - pl.col('std_') * sig, 
-        >>>                 pl.col('mean_') + pl.col('std_') * sig
-        >>>             ).cast(pl.Float32).alias('target_b')
-        >>>         )
-        >>> desc = [('clip_rolling', 'target의 범위를 pca0를 기준으로 rolling 통계를 이용하여 고정시킵니다.')]
-        >>> dfl_merge, df_feature = select_opr(dfl_merge, clip_target, desc, df_feature)
-    """
-    dfl_proc = select_proc(dfl)
-    if df_feat is not None:
-        df_feat_ = pd.DataFrame({
-            'val': dfl_proc.columns,
-            'type': [str(i) for i in dfl_proc.dtypes], 
-            'Description': [i[1] for i in desc],
-            'src': [src] * len(desc),
-        }).set_index('val')
-        df_feat = pd.concat([df_feat, df_feat_], axis=0)
-    d = []
-    for i in dfl_proc.columns:
-        if i in dfl.columns:
-            d.append(dfl_proc.drop_in_place(i))
-    dfl = dfl.with_columns(*d)
-    return dfl.hstack(dfl_proc), df_feat
+    Replaces the categories in a pandas Categorical Series based on a given rule.
 
-def apply_procs(dfl, procs, df_feat=None):
-    """
-    apply preprocessors
-    Parameters:
-        dfl: pl.DataFrame
-            Data DataFrame to process
-        procs: list
-            list of processor
-        df_feat: pd.DataFrame
-            Feature DataFrame, if None, does not fit model and make feature information
+    Args:
+        s (pd.Series): A pandas Series with categorical dtype (i.e., `pd.Categorical`).
+        rule (Union[Dict[str, str], Callable[[str], str]]): A mapping or function that defines the 
+            new category replacements.
+            - If `rule` is a dictionary, the keys are the original categories and the values are the 
+              replacements.
+            - If `rule` is a function, it takes an original category and returns the new category.
+
     Returns:
-        pl.DataFrame, pd.Dataframe
-            Data DataFrame, Feature DataFrame
-    Examples:
-        >>> procs = list()
-        >>> feat_assign = [
-        >>>     ('preproc1', 'Height_n', pl.col('Height').clip(0.004, 0.35), "Clip Height as Height_n")
-        >>> ]
-        >>> procs.append(partial(with_column_opr, proc_list=feat_assign))
-        >>>
-        >>> X_std = df_feature.query('src == "origin" and type == "Float32"').index.to_series().replace({'Height': 'Height_n'}).tolist()
-        >>> pipe_std_pca = make_pipeline(
-        >>>     StandardScaler(), 
-        >>>     ColumnTransformer([
-        >>>         ('std', 'passthrough', np.arange(len(X_std)).tolist()), 
-        >>>         ('pca', PCA(n_components=4), np.arange(len(X_std)).tolist())
-        >>>     ])
-        >>> )
-        >>> def info_prov(p, v):
-        >>>     if p == 'pca':
-        >>>         return ('pca', v, 'Size features PCA component ' + v, pl.Float32)
-        >>>     return ('std', v, 'StandardScaler: ' + v, pl.Float32)
-        >>> procs.append(partial(apply_processor, processor=pipe_std_pca, X_val=X_std, info_prov=info_prov))
-        >>>
-        >>> X_ord = df_feature.query('src == "origin" and type == "Categorical"').index.to_list()
-        >>> ord_enc = OrdinalEncoder(dtype=np.int32, handle_unknown='use_encoded_value', unknown_value=-1)
-        >>> procs.append(partial(apply_processor, processor=ord_enc, X_val=X_ord, info_prov=ord_prov))
-        >>> dfl_train, df_feature = apply_procs(dfl_train, procs, df_feature)
-        >>> dfl_org, _ = apply_procs(dfl_org, procs)
+        pd.Series: A new pandas Categorical object with the categories replaced 
+        according to the given rule.
+
+    Example:
+        >>> s = pd.Series(['a', 'b', 'c'], dtype='category')
+        >>> rule = {'a': 'x', 'b': 'x'}
+        >>> replace_cat(s, rule)
+        [x, x, c]
+        Categories (2, object): [x, c]
+
+        Or using a function:
+
+        >>> rule = lambda x: x.upper()
+        >>> replace_cat(s, rule)
+        [A, B, C]
+        Categories (3, object): [A, B, C]
+
     """
-    if df_feat is None:
-        for proc in procs:
-            dfl, _ = dfl.pipe(proc)
+    code_replace = {}
+    d = {}
+    for c, n in zip(
+        range(len(s.cat.categories)), 
+        s.cat.categories
+    ):
+        new_cat = rule.get(n, n) if type(rule) == dict else rule(n)
+        if new_cat in code_replace:
+            d[c] = code_replace[new_cat]
+        else:
+            d[c] = len(code_replace)
+            code_replace[new_cat] = len(code_replace)
+    if s.isna().sum() > 0:
+        return pd.Series(s.loc[s.notna()].pipe(
+                lambda x: pd.Series(
+                    pd.Categorical.from_codes(
+                        x.cat.codes.map(d), list(code_replace.keys()), ordered=x.cat.ordered
+                    ), index = x.index
+                )
+            ), index=s.index)
     else:
-        for proc in procs:
-            dfl, df_feat = dfl.pipe(partial(proc, df_feat=df_feat))
-    return dfl, df_feat
+        return pd.Series(
+            pd.Categorical.from_codes(
+                s.cat.codes.map(d), list(code_replace.keys()), ordered=s.cat.ordered
+            ), index=s.index
+        )
 
-def ord_prov(p, v):
+def rearrange_cat(s_cat, cat_type, repl_rule, use_set=False):
     """
-    Information provider for Oridinal Encoder
-    """
-    return ('ord', p, 'OrdinalEncoder: ' + p, pl.Int16)
+    Rearranges the categories of a pandas Categorical series based on a provided category type
+    and a replacement rule for missing categories.
 
-def ohe_prov(p, v):
+    Args:
+        s_cat (pd.Series): A pandas Series of categorical values that need to be rearranged.
+        cat_type (pd.api.types.CategoricalDtype): The target CategoricalDtype defining the desired
+            order and structure of categories.
+        repl_rule (callable): A function that defines a rule for handling categories in `s_cat`
+            that are not found in `cat_type`. The function should take two arguments:
+            `cat_vals` (the array of category values from `cat_type`) and `x` (a missing category
+            from `s_cat`). It returns the value to replace the missing category with.
+        use_set(Boolean): provide cat_vals with set
+    Returns:
+        pd.Categorical: A new pandas Categorical object with the categories of `s_cat` rearranged
+        according to `cat_type`, and with missing categories replaced based on `repl_rule`.
+
+    Example:
+        >>> cat_type = pd.api.types.CategoricalDtype(categories=["a", "b", "c"])
+        >>> s_cat = pd.Series(pd.Categorical(["a", "d", "b"]))
+        >>> def repl_rule(cat_vals, x):
+        ...     return 0  # Default to the first category if not found
+        >>> rearrange_cat(s_cat, cat_type, repl_rule)
+        [a, a, b]
+        Categories (3, object): [a, b, c]
     """
-    Information provider for OneHot Encoder
-    """
-    return ('ohe', p, 'OneHotEncoder: ' + v, pl.Int8)
+    cat_vals = cat_type.categories.values
+    s_map = pd.Series(np.arange(len(cat_vals)), cat_vals)
+    if use_set:
+        cat_vals_s = set(cat_vals)
+        s_cat_map = pd.Series(s_cat.cat.categories.values, s_cat.cat.categories.values).apply(
+            lambda x: s_map[x] if x in s_map else repl_rule(cat_vals_s, x)
+        )
+    else:
+        s_cat_map = pd.Series(s_cat.cat.categories.values, s_cat.cat.categories.values).apply(
+            lambda x: s_map[x] if x in s_map else repl_rule(cat_vals, x)
+        )
+    notna = s_cat.notna()
+    return s_cat.loc[notna].pipe(
+        lambda x: pd.Series(pd.Series(pd.Categorical.from_codes(x.map(s_cat_map), cat_vals), index=x.index), index=s_cat.index)
+    ) if notna.sum() != len(s_cat) else pd.Series(pd.Categorical.from_codes(s_cat.map(s_cat_map), cat_vals), index=s_cat.index)
+
+def split_preprocessor_var(s_names, org_names):
+    return s_names.str.split('__|_').apply(
+        lambda x: (x, [i for i in range(len(x), 0, -1) if '_'.join(x[1:i]) in org_names][0])
+    ).apply(
+        lambda x: pd.Series(['_'.join(x[0][:x[1]]), ''.join(x[0][x[1]:])], index=['var1', 'var2'])
+    )

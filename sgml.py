@@ -1,75 +1,441 @@
 from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OrdinalEncoder, MinMaxScaler, StandardScaler, OneHotEncoder
+
+try:
+    from sklearn.preprocessing import TargetEncoder
+except:
+    from category_encoders import TargetEncoder
+
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.pipeline import make_pipeline
-import pickle as pkl
+from sklearn.model_selection import train_test_split
+from functools import partial
+
+import joblib
 import numpy as np
 import pandas as pd
 import gc
+import os
+import shap
 
+try:
+    from tqdm.notebook import tqdm
+except:
+    from tqdm import tqdm
+
+def get_X_from_transformer(transformers, ex = None):
+    X = list()
+    for i in transformers:
+        X.extend(i[-1])
+    X = list(set(X))
+    if ex is None:
+        return X
+    else:
+        return [i for i in X if i not in ex]
+
+def get_ohe_transformer(hparams):
+    if 'X_ohe' in hparams:
+        return ('ohe', OneHotEncoder(**hparams.get('ohe', {})), hparams['X_ohe'])
+    return None
+
+def get_mm_transformer(hparams):
+    if 'X_mm' in hparams:
+        return ('mm', MinMaxScaler(), hparams['X_mm'])
+    return None
+
+def get_std_transformer(hparams):
+    if 'X_std' in hparams:
+        return ('std', StandardScaler(), hparams['X_std'])
+    return None
+
+def get_tgt_transformer(hparams):
+    if 'X_tgt' in hparams:
+        return ('tgt', TargetEncoder(**hparams.get('tgt', {})), hparams['X_tgt'])
+    return None
+
+def get_lda_transformer(hparams):
+    lda = hparams.get('lda', {})
+    if len(lda) == 0:
+        return None
+    X_lda, _, lda_transformers = get_transformers(lda)
+    if len(lda_transformers) > 0:
+        return (
+            'lda', make_pipeline(
+                ColumnTransformer(lda_transformers) if len(lda_transformers) > 1 else lda_transformers[0][1], 
+                LinearDiscriminantAnalysis(**lda.get('hparams', {}))
+            ), X_lda
+        )
+    return None
+
+def get_tsvd_transformer(hparams):
+    tsvd = hparams.get('tsvd', {})
+    if len(tsvd) == 0:
+        return None
+    X_tsvd, _, tsvd_transformers = get_transformers(tsvd)
+    if len(tsvd_transformers) > 0:
+        return (
+            'tsvd', make_pipeline(
+                ColumnTransformer(tsvd_transformers) if len(tsvd_transformers) > 1 else tsvd_transformers[1], 
+                TruncatedSVD(**tsvd.get('hparams', {}))
+            ), X_tsvd
+        )
+    return None
+
+def get_pca_transformer(hparams):
+    pca = hparams.get('pca', {})
+    if len(pca) == 0:
+        return None
+    X_pca, _, pca_transformers = get_transformers(pca)
+    if len(pca_transformers) > 0:
+        return (
+            'pca', make_pipeline(
+                ColumnTransformer(pca_transformers) if len(pca_transformers) > 1 else pca_transformers[1], 
+                PCA(**pca.get('hparams', {}))
+            ), X_pca
+        )
+    return None
+
+def get_transformers(hparams):
+    transformers = list()
+    for proc in [
+        get_mm_transformer, get_std_transformer, get_pca_transformer,
+        get_ohe_transformer, get_tgt_transformer, get_lda_transformer,
+        get_tsvd_transformer, get_ord_transformer
+    ]:
+        transformer = proc(hparams)
+        if transformer is not None:
+            transformers.append(transformer)
+    X_num = hparams.get('X_num', []) + hparams.get('X_pre_out', [])
+    if len(X_num) > 0:
+        transformers.append(('pt', 'passthrough', X_num))
+    X = get_X_from_transformer(transformers, hparams.get('X_pre_out', None))
+    return X, [], transformers
+
+def get_cat_transformers_ord(hparams):
+    X, _, transformers = get_transformers(hparams)
+    X_cat = hparams.get('X_cat', [])
+    if len(X_cat) > 0:
+        transformers = [('cat', OrdinalEncoder(dtype='int', **hparams.get('cat', {})), X_cat)] + transformers
+        X_cat_feature = np.arange(0, len(X_cat)).tolist()
+    else:
+        X_cat_feature = []
+    return get_X_from_transformer(transformers, hparams.get('X_pre_out', None)), X_cat_feature, transformers
+
+def get_ord_transformer(hparams):
+    if 'X_ord' in hparams:
+        return ('ord', OrdinalEncoder(**hparams['ord'], dtype = 'int'), hparams['X_ord'])
+    return None
+
+def get_cat_transformers_pt(hparams):
+    X, _, transformers = get_transformers(hparams)
+    X_cat = hparams.get('X_cat', [])
+    if len(X_cat) > 0:
+        transformers = [('cat', 'passthrough', X_cat)] + transformers
+        X_cat_feature = ['cat__{}'.format(i) for i in X_cat]
+    else:
+        X_cat_feature = None
+    if 'X_ord' in hparams:
+        if X_cat_feature is None:
+            X_cat_feature = list()
+        X_cat_feature = X_cat_feature + ['ord__{}'.format(i) for i in hparams['X_ord']]
+        
+    return get_X_from_transformer(transformers, hparams.get('X_pre_out', None)), X_cat_feature, transformers
+
+def get_cat_transformers_ohe(hparams):
+    X, _, transformers = get_transformers(hparams)
+    X_cat = hparams.get('X_cat', [])
+    if len(X_cat) > 0:
+        transformers = [('cat', OneHotEncoder(**hparams.get('cat', {})), X_cat)] + transformers
+    return get_X_from_transformer(transformers, hparams.get('X_pre_out', None)), [], transformers
+
+def is_empty_transformer(transformers):
+    return transformers is None or len(transformers) == 0 or (len(transformers) == 1 and transformers[0][1] == 'passthrough')
 
 def gb_valid_config(train_set, valid_set):
     return {}, {'eval_set': [train_set, valid_set] if valid_set is not None else [train_set]}
 
-def sgnn_valid_config(train_set, valid_set):
-    return {}, {'eval_set': valid_set if valid_set is not None else None}
+def gb_valid_config2(train_set, valid_set):
+    return {}, {'eval_set': [valid_set] if valid_set is not None else [train_set]}
 
-def lgb_learning_result(m, train_result):
-    return (
-        pd.concat([
+def gb_valid_config_valid_only(train_set, valid_set):
+    return {}, {'eval_set': [valid_set]}
+
+def pass_learning_result(train_result):
+    return train_result
+
+def lgb_learning_result(train_result):
+    """
+    Process LightGBM model results to extract evaluation metrics and feature importances.
+
+    This function extracts and formats the training evaluation metrics and feature importances 
+    from a trained LightGBM model.
+
+    Parameters:
+        m (lightgbm.Booster or lightgbm.sklearn.LGBMModel): 
+            The trained LightGBM model object that contains the evaluation results and feature importances.
+        train_result (dict): 
+            A dictionary containing training-related information, including the names of the features used.
+        preprocessor (object, optional): 
+            A preprocessing object if used in the model pipeline (not utilized in this function, but included for consistency).
+
+    Returns:
+        tuple: A tuple containing:
+            - pd.DataFrame or None: A DataFrame containing evaluation metrics for each dataset and metric, indexed by iteration. 
+              If no evaluation results are present, returns None.
+            - pd.Series: A Series of feature importances sorted in ascending order, indexed by feature names.
+            - dict: The original `train_result` dictionary.
+    """
+    return {
+        'valid_result': pd.concat([
             pd.DataFrame(
-                m.evals_result_[i]
-            ).rename(columns=lambda x: (i, x)) for i in m.evals_result_.keys()
+                train_result['model'].evals_result_[i]
+            ).rename(columns=lambda x: (i, x)) for i in train_result['model'].evals_result_.keys()
         ], axis=1).pipe(
             lambda x: x.reindex(columns = pd.MultiIndex.from_tuples(x.columns.tolist(), names=['set', 'metric'])).swaplevel(axis=1)
-        ) if len(m.evals_result_) > 0 else None, 
-        pd.Series(
-            m.feature_importances_, index=train_result['variables']
-        ).sort_values(),
-        train_result
-    )
+        ) if hasattr(train_result['model'], 'evals_result_') and len(train_result['model'].evals_result_) > 0 else None, 
+        'feature_importance': pd.Series(train_result['model'].feature_importances_, index=train_result['variables']).sort_values(),
+        **{k: v for k, v in train_result.items() if k != 'model'}
+    }
 
-def xgb_learning_result(m, train_result):
-    return (
-        pd.concat([
+def xgb_learning_result(train_result):
+    return {
+        'valid_result': pd.concat([
             pd.DataFrame(
-                m.evals_result_[i]
-            ).rename(columns=lambda x: (i, x)) for i in m.evals_result_.keys()
+                train_result['model'].evals_result_[i]
+            ).rename(columns=lambda x: (i, x)) for i in train_result['model'].evals_result_.keys()
         ], axis=1).pipe(
             lambda x: x.reindex(columns = pd.MultiIndex.from_tuples(x.columns.tolist(), names=['set', 'metric'])).swaplevel(axis=1)
-        ), 
-        pd.Series(
-            m.feature_importances_, index=train_result['variables']
+        ) if hasattr(train_result['model'], 'evals_result_') else None, 
+        'feature_importance': pd.Series(
+            train_result['model'].feature_importances_, index=train_result['variables']
         ).sort_values(),
-        train_result
-    )
+        **{k: v for k, v in train_result.items() if k != 'model'}
+    }
 
-def cb_learning_result(m, train_result):
-    return (
-        pd.concat([
+def cb_learning_result(train_result):
+    return {
+        'valid_result': pd.concat([
             pd.DataFrame(
-                m.evals_result_[i]
-            ).rename(columns=lambda x: (i, x)) for i in m.evals_result_.keys()
+                train_result['model'].evals_result_[i]
+            ).rename(columns=lambda x: (i, x)) for i in train_result['model'].evals_result_.keys()
         ], axis=1).pipe(
             lambda x: x.reindex(columns = pd.MultiIndex.from_tuples(x.columns.tolist(), names=['set', 'metric'])).swaplevel(axis=1)
-        ), 
-        pd.Series(
-            m.feature_importances_, index=train_result['variables']
+        ) if hasattr(train_result['model'], 'evals_result_') else None, 
+        'feature_importance': pd.Series(
+            train_result['model'].feature_importances_, index=train_result['variables']
         ).sort_values(),
-        train_result
+        **{k: v for k, v in train_result.items() if k != 'model'}
+    }
+
+def gb_shap_learning_result(train_result, df, interaction = True):
+    explainer = shap.TreeExplainer(train_result['model'])
+    processor = train_result['preprocessor']
+    result = {
+        'X': pd.DataFrame(processor.transform(df), index=df.index, columns=train_result['variables'])
+    }
+    result['shap_values'] = explainer.shap_values(result['X'])
+    if interaction:
+        result['shap_interaction_values'] = explainer.shap_interaction_values(result['X'])
+    return result
+
+def cb_interaction_importance(train_result):
+    s_name = pd.Series(train_result['variables'])
+    return pd.DataFrame(
+        train_result['model'].get_feature_importance(type = 'Interaction'),
+        columns = ['Var1', 'Var2', 'Importance']
+    ).assign(
+        Var1 = lambda x: x['Var1'].map(s_name),
+        Var2 = lambda x: x['Var2'].map(s_name),
     )
 
-def sgnn_learning_result(m, train_result):
-    return (
-        pd.DataFrame(m.history_),
-        train_result
-    )
+def lr_learning_result(train_result):
+    return {
+        'coef': pd.Series(train_result['model'].coef_, index=train_result['variables']) if len(train_result['model'].coef_.shape) == 1 else \
+            pd.DataFrame(train_result['model'].coef_.T, index=train_result['variables'])
+    } if type(train_result['model'].coef_) == np.ndarray else {
+        'coef': pd.Series(train_result['model'].coef_.values, index=train_result['variables']) if len(train_result['model'].coef_.shape) == 1 else \
+            pd.DataFrame(train_result['model'].coef_.T.values, index=train_result['variables'])
+    }
 
-def train_model(model, model_params, df_train, X, y, valid_splitter=None, preprocessor=None, fit_params={}, valid_config_proc = None):
+class LGBMFitProgressbar:
+    def __init__(self, precision = 5, start_position=0, metric=None, greater_is_better = True, update_cycle = 30):
+        self.start_position = start_position
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.metric = metric
+        self.metric_hist = list()
+        self.greater_is_better = greater_is_better
+        self.update_cycle = update_cycle
+
+    def __repr__(self):
+        return 'LGBMFitProgressbar'
+    
+    def _init(self, env):
+        self.total_iteration = env.end_iteration - env.begin_iteration
+        self.progress_bar = tqdm(total=self.total_iteration, desc='Round', position=self.start_position, leave=False)
+        self.prog = 0
+
+    def __call__(self, env):
+        if env.iteration == env.begin_iteration:
+            self._init(env)
+        self.prog += 1
+        if (self.prog % self.update_cycle) != 0:
+            if self.total_iteration - 1 == env.iteration - env.begin_iteration:
+                self.progress_bar.update(self.prog % self.update_cycle)
+                self.progress_bar.close()
+                del self.progress_bar
+                self.progress_bar = None
+            return
+        self.progress_bar.update(self.update_cycle)
+        if env.evaluation_result_list is not None:
+            results = list()
+            for item in env.evaluation_result_list:
+                if len(item) >= 3:
+                    data_name, eval_name, result = item[:3]
+                    results.append(
+                        '{}_{}:{}'.format(data_name, eval_name, self.fmt.format(result))
+                    )
+                    if self.metric == '{}_{}'.format(data_name, eval_name):
+                        self.metric_hist.append(result)
+            if self.metric is not None:
+                if self.greater_is_better:
+                    results.append(
+                        'Best {}: {}/{}'.format(self.metric, np.argmax(self.metric_hist) + 1, self.fmt.format(np.max(self.metric_hist)))
+                    )
+                else:
+                    results.append(
+                        'Best {}: {}/{}'.format(self.metric, np.argmin(self.metric_hist) + 1, self.fmt.format(np.min(self.metric_hist)))
+                    )
+            self.progress_bar.set_postfix_str(', '.join(results))
+        if self.total_iteration - 1 == env.iteration - env.begin_iteration:
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+
+try:
+    import xgboost as xgb
+    class XGBFitProgressbar(xgb.callback.TrainingCallback):
+        def __init__(self, n_estimators, precision=5, start_position=0, metric=None, greater_is_better=True, update_cycle=30):
+            self.start_position = start_position
+            self.n_estimators = n_estimators
+            self.fmt = '{:.' + str(precision) + 'f}'
+            self.metric = metric
+            self.metric_hist = []
+            self.greater_is_better = greater_is_better
+            self.progress_bar = None
+            self.update_cycle = update_cycle
+        
+        def __repr__(self):
+            return 'XGBFitProgressbar'
+        
+        def before_training(self, model):
+            self.progress_bar = tqdm(total=self.n_estimators, desc='Round', position=self.start_position, leave=False)
+            self.prog = 0
+            return model
+    
+        def after_iteration(self, model, epoch, evals_log):
+            # 진행 상태를 업데이트
+            self.prog += 1
+            if (self.prog % self.update_cycle) != 0:
+                return False
+            self.progress_bar.update(self.update_cycle)
+    
+            results = []
+            for data_name, metrics in evals_log.items():
+                for eval_name, eval_results in metrics.items():
+                    result = eval_results[-1]
+                    results.append(f'{data_name}_{eval_name}:{self.fmt.format(result)}')
+                    if self.metric == f'{data_name}_{eval_name}':
+                        self.metric_hist.append(result)
+    
+            if self.metric is not None and self.metric_hist:
+                if self.greater_is_better:
+                    best_round = np.argmax(self.metric_hist) + 1
+                    best_value = np.max(self.metric_hist)
+                else:
+                    best_round = np.argmin(self.metric_hist) + 1
+                    best_value = np.min(self.metric_hist)
+    
+                results.append(f'Best {self.metric}: {best_round}/{self.fmt.format(best_value)}')
+    
+            self.progress_bar.set_postfix_str(', '.join(results))
+    
+            # False를 반환하면 학습이 계속 진행됨
+            return False
+    
+        def after_training(self, model):
+            # 학습이 종료되면 진행바를 닫음
+            self.progress_bar.update(self.n_estimators)
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+            return model
+except:
+    pass
+
+class CatBoostFitProgressbar:
+    def __init__(self, n_estimators, precision=5, start_position=0, metric=None, greater_is_better=True, update_cycle = 10):
+        self.start_position = start_position
+        self.n_estimators = n_estimators
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.metric = metric
+        self.metric_hist = list()
+        self.greater_is_better = greater_is_better
+        self.progress_bar = None
+        self.update_cycle = update_cycle
+        self.prog = 0
+    
+    def __repr__(self):
+            return 'CatBoostFitProgressbar'
+    
+    def after_iteration(self, info):
+        if self.progress_bar is None:
+            self.progress_bar = tqdm(total=self.n_estimators, desc='Round', position=self.start_position, leave=False)
+
+        self.prog += 1
+        if (self.prog % self.update_cycle) != 0:
+            return True
+        self.progress_bar.update(self.update_cycle)
+        results = list()
+        if info.metrics is not None:
+            for k, v in info.metrics.items():
+                results_2 = list()
+                for k2, v2 in v.items():
+                    results_2.append('{}: {}'.format(k2, self.fmt.format(v2[-1])))
+                    if self.metric == f'{k}_{k2}':
+                        self.metric_hist.append(v2[-1])
+                results.append('{}: {}'.format(k, ', '.join(results_2)))
+
+        if self.metric is not None and self.metric_hist and len(self.metric_hist) > 0:
+            if self.greater_is_better:
+                best_round = np.argmax(self.metric_hist) + 1
+                best_value = np.max(self.metric_hist)
+            else:
+                best_round = np.argmin(self.metric_hist) + 1
+                best_value = np.min(self.metric_hist)
+
+            results.append(f'Best {self.metric}: {best_round}/{self.fmt.format(best_value)}')
+        
+        self.progress_bar.set_postfix_str(', '.join(results))
+        if self.progress_bar.n == self.n_estimators:
+            self.after_train()
+        return True
+
+    def after_train(self):
+        if self.progress_bar is not None:
+            self.progress_bar.close()
+            del self.progress_bar
+            self.progress_bar = None
+
+
+def train_model(model, model_params, df_train, X, y, valid_splitter=None, preprocessor=None, fit_params={}, valid_config_proc = None, target_func=None, **argv):
     """
     Train a model
     Parameters:
         model: Class
             Model class
-        model_param: dict
+        model_params: dict
             Model hyper parameters
         df_train: pd.DataFrame
             Train data
@@ -86,8 +452,8 @@ def train_model(model, model_params, df_train, X, y, valid_splitter=None, prepro
         valid_config_proc: function
             validation configuration function
     Returns
-        object, dict
-        model instance, train result
+        dict
+        train_resu;t
     Examples
     >>> X_cont =['Diameter', 'Whole weight.2', 'Whole weight.1', 'Shell weight', 'Length', 'Height_n', 'Whole weight']
     >>> X_cat = ['Sex']
@@ -108,6 +474,10 @@ def train_model(model, model_params, df_train, X, y, valid_splitter=None, prepro
         if valid_splitter is not None:
             df_train, df_valid = valid_splitter(df_train)
         X_train = preprocessor.fit_transform(df_train[X], df_train[y])
+        n_categ = argv.get('categorical_num', 0)
+        if n_categ > 0:
+            model_params = model_params.copy()
+            model_params['feature_types'] = ["c" if i < n_categ else "q" for i in range(X_train.shape[-1])]
         result['variables'] = preprocessor.get_feature_names_out()
         if valid_splitter is not None:
             X_valid = preprocessor.transform(df_valid[X])
@@ -117,28 +487,73 @@ def train_model(model, model_params, df_train, X, y, valid_splitter=None, prepro
             X_valid = df_valid[X]
         X_train = df_train[X]
         result['variables'] = X.copy()
+    if target_func is None:
+        y_train = df_train[y]
+        if df_valid is not None:
+            y_valid = df_valid[y]
+    else:
+        y_train = target_func(df_train, df_train[y])
+        if df_valid is not None:
+            y_valid = target_func(df_valid, df_valid[y])
     if valid_config_proc is not None:
         if X_valid is not None:
-            model_params_2, fit_params_2 = valid_config_proc((X_train, df_train[y]), (X_valid, df_valid[y]))
+            model_params_2, fit_params_2 = valid_config_proc((X_train, y_train), (X_valid, y_valid))
             result['valid_shape'] = X_valid.shape
         else:
-            model_params_2, fit_params_2 = valid_config_proc((X_train, df_train[y]), None)
+            model_params_2, fit_params_2 = valid_config_proc((X_train, y_train), None)
     else:
         model_params_2, fit_params_2 = {}, {}
     result['train_shape'] = X_train.shape
     result['target'] = y
     m =  model(**model_params, **model_params_2)
-    m.fit(X_train, df_train[y], **fit_params, **fit_params_2)
-    del X_train
+    m.fit(X_train, y_train, **fit_params, **fit_params_2)
+    del X_train, y_train
     if df_valid is not None:
-        del X_valid, df_valid
+        del X_valid, y_valid, df_valid
     gc.collect()
+    result['model'] = m
     if preprocessor is not None:
-        m = make_pipeline(preprocessor, m)
-    return m, result
+        result['preprocessor'] = preprocessor
+    return result
 
-def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, sp_y=None):
+class BaseCallBack:
+    def start(self, n_splits):
+        pass
+    def start_fold(self, fold):
+        pass
+    def end_fold(self, fold, train_metrics, valid_metrics, model_result_cv):
+        pass
+    def end(self):
+        pass
+
+class ProgressCallBack(BaseCallBack):
+    def __init__(self, precision=5, start_position=0):
+        self.start_position = start_position
+        self.fmt = '{:.' + str(precision) + 'f}'
+        self.progress_bar = None
+    
+    def start(self, n_splits):
+        self.progress_bar = tqdm(total=n_splits, desc='Fold', position=self.start_position, leave=False)
+    
+    def end_fold(self, fold, train_metrics, valid_metrics, model_result_cv):
+        self.progress_bar.update(1)
+        results = list()
+        if len(train_metrics) > 0:
+            results.append(
+                '{}±{}'.format(self.fmt.format(np.mean(train_metrics)), self.fmt.format(np.std(train_metrics)))
+            )
+        results.append(
+            '{}±{}'.format(self.fmt.format(np.mean(valid_metrics)), self.fmt.format(np.std(valid_metrics)))
+        )
+        self.progress_bar.set_postfix_str(', '.join(results))
+    def end(self):
+        self.progress_bar.close()
+        del self.progress_bar
+        self.progress_bar = None
+
+def cv_model(sp, model, model_params, df, X, y, predict_func, score_func, return_train_scores = True,
+            preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, sp_y=None, groups=None, 
+            target_func=None, target_invfunc=None, progress_callback=None):
     """
     Train a model
     Parameters:
@@ -156,14 +571,22 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
             target variable
         predict_func: function
             prediction function
-        eval_metric: function
-            score functiongb_valid_config
+        score_func: function
+            score function
+        return_train_scores: bool
+            return train scores
         preprocessor: sklearn.preprocessing. 
             preprocessor. it will be connected using make_pipeline
         fit_params: dict
             parameters for fit
         sp_y: str
             splitter y value name
+        target_func: function
+            function to transform the target
+        target_inv_func: function
+            inverse function to transform the predicted target
+        progress_callback: function
+            callback ffunction for showing the validation progress
     Returns
         list, list, Series, list
         train_metrics, valid_metrics, s_prd, model_result_cv
@@ -173,13 +596,13 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
     >>> X_all = X_cont + X_cat
     >>> def predict(m, df_valid, X):
     >>>     return pd.Series(m.predict(df_valid[X]), index=df_valid.index)
-    >>> def eval_metric(y_true, prds):
-    >>>     return mean_squared_error(y_true.sort_index(), prds.sort_index()) ** 0.5
+    >>> def score_func(y_true, prds):
+    >>>     return -(mean_squared_error(y_true.sort_index(), prds.sort_index()) ** 0.5)
     >>> def gb_valid_config(train_set, valid_set):
     >>>     return {}, {'eval_set': [train_set, valid_set] if valid_set is not None else [train_set]}
     >>> cv_model(StratifiedKFold(n_splits=5, random_state=123, shuffle=True), 
-    >>>          lgb.LGBMRegressor, {'verbose': -1}, df_train_sp, X_all, 'target',
-    >>>         predict_func=predict, eval_metric = eval_metric,
+    >>>         lgb.LGBMRegressor, {'verbose': -1}, df_train_sp, X_all, 'target',
+    >>>         predict_func=predict, scores = score_func,
     >>>         train_params={
     >>>             'valid_splitter': lambda x: train_test_split(x, train_size=0.9, stratify=x['Rings'], random_state=123),
     >>>             'fit_params': {'categorical_feature': ['Sex'], 'callbacks': [lgb.early_stopping(5, verbose=False)]},
@@ -187,487 +610,267 @@ def cv_model(sp, model, model_params, df, X, y, predict_func, eval_metric,
     >>>         }, sp_y = 'Rings'
     >>> )
     """
-    train_metrics, valid_metrics = list(), list()
+    train_scores, valid_scores = list(), list()
     valid_prds = list()
     if sp_y is None:
         sp_y = y
-    model_result_cv = list()
-    for train_idx, valid_idx in sp.split(df[X], df[sp_y]):
+    model_result = list()
+    sp_params = {'X': df[X], 'y': df[sp_y], 'groups': None if groups is None else df[groups]}
+    if progress_callback is None:
+        progress_callback = BaseCallBack()
+    progress_callback.start(sp.get_n_splits(**sp_params))
+    for fold, (train_idx, valid_idx) in enumerate(sp.split(**sp_params)):
+        progress_callback.start_fold(fold)
         df_cv_train, df_valid = df.iloc[train_idx], df.iloc[valid_idx]
         if train_data_proc != None:
             df_cv_train = train_data_proc(df_cv_train)
-        m, train_result = train_model(model, model_params, df_cv_train, X, y, preprocessor=preprocessor, **train_params)
-        valid_prds.append(predict_func(m, df_valid, X))
-        valid_metrics.append(eval_metric(df_valid, valid_prds[-1]))
-        train_metrics.append(eval_metric(df_cv_train, predict_func(m, df_cv_train, X)))
-        if result_proc is not None:
-            if preprocessor is None:
-                train_result = result_proc(m, train_result)
-            else:
-                train_result = result_proc(m[-1], train_result)
-        model_result_cv.append(train_result)
-    s_prd = pd.concat(valid_prds, axis=0)
-    return train_metrics, valid_metrics, s_prd, model_result_cv
-
-class SGStacking:
-    def __init__(self, df_train, target, sp, predict_func, eval_metric, greater_better=True, sp_y=None):
-        """
-        Parameters
-            df_train: pd.DataFrame
-                training data
-            target: str
-                target value name
-            sp: Splitter
-                sklearn spliiter object
-            predict_func: function
-                extract prediction result from model
-            eval_metric: function
-                evaluation metric function
-            greater_better: Boolean
-                True: the greater, the better False: the greater, the worse
-            sp_y: str
-                value name for splitter target, if None target value used
-        Examples
-        >>> cv5 = StratifiedKFold(n_splits=5, random_state=123, shuffle=True)
-        >>> def predict(m, df_valid, X):
-        >>>     return pd.Series(m.predict(df_valid[X]), index=df_valid.index)
-        >>> def eval_metric(y_true, prds):
-        >>>     return mean_squared_error(y_true.sort_index(), prds.sort_index()) ** 0.5
-        >>> stk = SGStacking(df_train, 'target', sp=cv5, predict_func=predict, eval_metric=eval_metric,  greater_better=False)
-        """
-        self.df_train = df_train
-        self.target = target
-        self.sp = sp
-        self.predict_func = predict_func
-        self.eval_metric = eval_metric
-        self.model_result = {}
-        self.selected_models = {}
-        self.greater_better = greater_better
-        self.meta_model = None
-        self.meta_X = None
-        self.sp_y = sp_y
-
-    def get_result(self, model_name, model, preprocessor, model_param, X):
-        """
-        get the results of the model
-        Parameters:
-            model_name: str
-                model name
-            model: Class
-                Class of model
-            preprocessor: object
-                sklearn preprocessor object
-            model_param: dict
-                model parameter
-            X: list
-                list of variable names
-        Returns:
-            dict
-            {
-                'model': model list
-                'model param': the parameters of model
-                'train_metrics': the metrics of train
-                'valid_metrics': the metrics of validation
-            }
-        """
-        if model_name in self.model_result:
-            result_ = self.model_result[model_name]
-            model_key = str(model) + str(preprocessor) + str(model_param) + ','.join(X)
-            if model_key in result_['model_key']:
-                idx = result_['model_key'].index(model_key)
-                return {
-                    'model': result_['model'][idx],
-                    'preprocessor': result_['preprocessor'][idx],
-                    'model_param': result_['model_params'][idx],
-                    'train_metrics': result_['train_metrics'][idx],
-                    'valid_metrics': result_['valid_metrics'][idx],
-                }
-            return None
-        return None
-    
-    def _put_result(self, model_name, model, preprocessor, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv, train_info):
-        model_key = str(model) + str(preprocessor) + str(model_params) + ','.join(X)
-        if model_name in self.model_result:
-            result_ = self.model_result[model_name]
-            if model_key in result_['model_key']:
-                idx = result_['model_key'].index(model_key)
-                result_['train_info'][idx] = train_info
-                result_['train_metrics'][idx] = train_metrics
-                result_['valid_metrics'][idx] = valid_metrics
-                metric = np.mean(valid_metrics)
-                if result_['best_result'] is None or \
-                    (self.greater_better and metric >= np.max(result_['metric'])) or \
-                    (not self.greater_better and metric <= np.min(result_['metric'])):
-                    result_['best_result'] = (s_prd, model_result_cv)
-                    if model_name in self.selected_models:
-                        del self.selected_models[model_name]
-                result_['metric'][idx] = metric
+        result = train_model(model, model_params, df_cv_train, X, y, preprocessor=preprocessor, target_func=target_func, **train_params)
+        if 'preprocessor' in result:
+            m = make_pipeline(result['preprocessor'], result['model'])
         else:
-            result_ = {
-                'model_key': [],
-                'model': [],
-                'preprocessor': [],
-                'model_params': [],
-                'X': [],
-                'train_metrics': [],
-                'valid_metrics': [],
-                'metric': [],
-                'train_info': [],
-                'best_result': None
-            }
-            self.model_result[model_name] = result_
-        result_['model_key'].append(model_key)
-        result_['model'].append(model)
-        result_['preprocessor'].append(preprocessor)
-        result_['model_params'].append(model_params)
-        result_['X'].append(X)
-        result_['train_metrics'].append(train_metrics)
-        result_['valid_metrics'].append(valid_metrics)
-        result_['train_info'].append(train_info)
-        metric = np.mean(valid_metrics)
-        if result_['best_result'] is None or \
-            (self.greater_better and metric >= np.max(result_['metric'])) or \
-            (not self.greater_better and metric <= np.min(result_['metric'])):
-            result_['best_result'] = (s_prd, model_result_cv)
-            if model_name in self.selected_models:
-                del self.selected_models[model_name]
-        result_['metric'].append(metric)
-
-    def append_vars(self, pd_vars):
-        """
-        Append varaibles to train data
-        Parameters:
-            pd_vars: pd.DataFrame or pd.Series
-        """
-        if (pd_vars.index == self.df_train.index).all():
-            self.df_train = pd.concat([self.df_train, pd_vars], axis=1)
-        else:
-            raise Exception("pd_vars should have same index with existing train data")
-    
-    def compact_result(self, model_name):
-        """
-        Store only the result of best trial
-        """
-        result_new_ = {
-            'model_key': [],
-            'model': [],
-            'model_params': [],
-            'X': [],
-            'train_metrics': [],
-            'valid_metrics': [],
-            'metric': [],
-        }
-        result_ = self.model_result[model_name]
-        if self.greater_better:
-            idx = np.argmax(result_['metric'])
-        else:
-            idx = np.argmin(result_['metric'])
-        result_new_['model'].append(result_['model'][idx])
-        result_new_['preprocessor'].append(result_['preprocessor'][idx])
-        result_new_['model_params'].append(result_['model_params'][idx])
-        result_new_['X'].append(result_['X'][idx])
-        result_new_['train_metrics'].append(result_['train_metrics'][idx])
-        result_new_['valid_metrics'].append(result_['valid_metrics'][idx])
-        result_new_['metric'].append(result_['metric'][idx])
-        result_new_['train_info'].append(result_['train_info'][idx])
-        result_new_['best_result'] = result_['best_result']
-        self.model_result[model_name] = result_new_
-
-    def reset_model(self, model_name):
-        del self.model_result[model_name]
-    
-    def get_best_results(self, model_names):
-        tmp = list()
-        for model_name in model_names:
-            result_ = self.model_result[model_name]
-            result_new_ = dict()
-            if self.greater_better:
-                idx = np.argmax(result_['metric'])
-            else:
-                idx = np.argmin(result_['metric'])
-            result_new_['model'] = result_['model'][idx]
-            result_new_['preprocessor'] = result_['preprocessor'][idx]
-            result_new_['model_params'] = result_['model_params'][idx]
-            result_new_['X'] = result_['X'][idx]
-            result_new_['train_metrics'] = result_['train_metrics'][idx]
-            result_new_['valid_metrics'] = result_['valid_metrics'][idx]
-            result_new_['train_info'] = result_['train_info'][idx]
-            tmp.append(pd.Series(result_new_))
-        return pd.DataFrame(tmp).assign(
-            model = lambda x: x['model'].apply(lambda x: str(x).split('.')[-1][:-2]),
-            X = lambda x: x['X'].apply(lambda x: ','.join(x)),
-            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
-            valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
-        )
-
-    def get_best_result(self, model_name):
-        result_ = self.model_result[model_name]
-        if self.greater_better:
-            idx = np.argmax(result_['metric'])
-        else:
-            idx = np.argmin(result_['metric'])
-        
-        ret = self.get_result(model_name, result_['model'][idx], result_['preprocessor'][idx], result_['model_params'][idx], result_['X'][idx])
-        return ret, result_['best_result'][1]
-    
-    def eval_model(self, model_name, model, model_params, X,  
-                   preprocessor=None, result_proc=None, train_data_proc=None, train_params={}, rerun=False):
-        """
-        Evaluate a base model and store the result.
-        Parameters:
-            model_name: str
-                모델명
-            model: Class
-                Model class
-            model_param: dict
-                Model hyper parameters
-            X: list
-                input variable names
-            preprocessor: sklearn.preprocessing. 
-                preprocessor. it will be connected using make_pipeline
-            result_proc: function
-                the processor for the result of training 
-            train_data_proc: function
-                the processor for traing data
-            train_params: 
-                the parameter for train_model
-            rerun: Boolean
-                Rerun
-        Returns
-            object, dict
-            model information, train result 
-        Example
-        >>> lgb_result, train_result = stk.eval_model(
-        >>>    'lgb_1', lgb.LGBMRegressor, {'verbose': -1, 'n_estimators': 140}, X_all,
-        >>>    result_proc=lgb_learning_result,
-        >>>    train_params={
-        >>>         'valid_splitter': valid_splitter, 
-        >>>         'fit_params': {'categorical_feature': ['Sex'], 'callbacks': [lgb.early_stopping(5, verbose=False)]}, 
-        >>>         'valid_config_proc': gb_valid_config
-        >>>     }
-        >>> )
-        """
-        if not rerun:
-            result = self.get_result(model_name, model, preprocessor, model_params, X)
-            if result != None:
-                return result, None
-        train_metrics, valid_metrics, s_prd, model_result_cv = \
-            cv_model(
-                self.sp, model, model_params, self.df_train, X, self.target, self.predict_func, self.eval_metric,
-                preprocessor=preprocessor, result_proc=result_proc, train_data_proc=train_data_proc, train_params=train_params, sp_y=self.sp_y
+            m = result['model']
+        if target_invfunc is None:
+            target_invfunc = lambda _, x: x
+        valid_prds.append(target_invfunc(df_valid, predict_func(m, df_valid, X)))
+        if return_train_scores:
+            train_scores.append(
+                score_func(df_cv_train, target_invfunc(df_cv_train, predict_func(m, df_cv_train, X)))
             )
-        train_info = {
-            'result_proc': result_proc, 'train_data_proc': train_data_proc, 'train_params': train_params
-        }
-        self._put_result(model_name, model, preprocessor, model_params, X, train_metrics, valid_metrics, s_prd, model_result_cv, train_info)
-        return self.get_result(model_name, model, preprocessor, model_params, X), model_result_cv
-
-    def get_model_results(self, model_name):
-        """
-        get the training results of the model
-        Parameters:
-            model_name: str
-        Returns:
-            DataFrame
-            the dataframe which contains the training results
-        """
-        tmp = self.model_result[model_name].copy()
-        del tmp['best_result'], tmp['model_key'], tmp['metric']
-        return pd.DataFrame(tmp).assign(
-            model = lambda x: x['model'].apply(lambda x: str(x).split('.')[-1][:-2]),
-            X = lambda x: x['X'].apply(lambda x: ','.join(x)),
-            train_metrics = lambda x: x['train_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
-            valid_metrics = lambda x: x['valid_metrics'].apply(lambda x: '{:.5f}±{:.5f}'.format(np.mean(x), np.std(x))),
-        )
-        
-    def select_model(self, model_name, rerun=False):
-        """
-        Select the model and fit the model with the best parameter for base model. And store the model instance and cv prediction of the model.
-        Parameters:
-            model_name: str
-                모델명
-        Returns:
-            object, dict, float
-            model instance, train result, train metric
-        
-        Example:
-        >>> lgb_result, train_result = stk.eval_model(
-        >>>     'lgb_1', lgb.LGBMRegressor, 
-        >>>     {'verbose': -1, 'n_estimators': 1500, 'learning_rate': 0.01, 'colsample_bytree': 0.75, 'subsamples': 0.75, 'num_leaves': 63}, 
-        >>>     X_all, 
-        >>>     result_proc=lgb_learning_result,
-        >>>     train_data_proc=partial(merge_org, df_org=df_org),
-        >>>     train_params={
-        >>>         'valid_splitter': valid_splitter, 
-        >>>         'fit_params': {'categorical_feature': ['Sex'], 'callbacks': [lgb.early_stopping(5, verbose=False)]}, 
-        >>>         'valid_config_proc': gb_valid_config
-        >>>     }, sp_y = 'Rings'
-        >>> )    
-        >>> stk.select_model('lgb_1')
-        """
-        if not rerun and model_name in self.selected_models:
-            return self.selected_models[model_name][0], self.selected_models[model_name][1], self.selected_models[model_name][2]
-        result_ = self.model_result[model_name]
-        if self.greater_better:
-            idx = np.argmax(result_['metric'])
-        else:
-            idx = np.argmin(result_['metric'])
-        model = result_['model'][idx]
-        preprocessor = result_['preprocessor'][idx]
-        X = result_['X'][idx]
-        model_params = result_['model_params'][idx]
-
-        train_info = result_['train_info'][idx]
-        train_data_proc = train_info['train_data_proc']
-        train_params = train_info['train_params']
-        result_proc = train_info['result_proc']        
-        if train_data_proc is not None:
-            df = train_data_proc(df)
-        m, train_result = train_model(model, model_params, self.df_train, X, self.target, preprocessor=preprocessor, **train_params)
-        train_metric = self.eval_metric(self.df_train, self.predict_func(m, self.df_train, X))
+        valid_scores.append(score_func(df_valid, valid_prds[-1]))
         if result_proc is not None:
-            if preprocessor is None:
-                train_result = result_proc(m, train_result)
+            if type(result_proc) is list:
+                for proc in result_proc:
+                    model_result.append(proc(result))
             else:
-                train_result = result_proc(m[-1], train_result)
-        self.selected_models[model_name] = (
-            m, X, train_result, train_metric
-        )
-        return m, train_result, train_metric
+                model_result.append(result_proc(result))
+        progress_callback.end_fold(fold, train_scores, valid_scores, model_result)
+        del df_cv_train, df_valid, m
+        result = None
+        gc.collect()
+    s_prd = pd.concat(valid_prds, axis=0).sort_index()
+    progress_callback.end()
+    ret = {'valid_scores': valid_scores, 'valid_prd': s_prd, 'model_result': model_result}
+    if return_train_scores:
+        ret['train_scores'] = train_scores
+    return ret
 
-    def get_selected_model(self):
-        return list(self.selected_models.keys())
-    
-    def eval_meta_model(self, model, model_params, model_names, result_proc=None, train_params={}, inc_vals=[]):
-        """
-        Evaluate the meta model
-        Parameters:
-            model: Class
-                Model class
-            model_param: dict
-                Model hyper parameters
-            model_names: list
-                the name list of base models to include meta model
-            result_proc: function
-                the processor for the result of training 
-            train_data_proc: function
-                the processor for traing data
-            train_params: 
-                the parameter for train_model
-            inc_vals: list
-                the variables names to include to the meta model data
-        Returns:
-            list, list, list
-            train_metric, valid_metrics, cv results
-        """
-        vals = [self.target] + inc_vals
-        if self.sp_y is not None:
-            vals.append(self.sp_y)
-        df = pd.concat([
-                self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [self.df_train[vals]], axis=1).sort_index()
-        train_metrics, valid_metrics, s_prd, model_result_cv = cv_model(
-            self.sp, model, model_params, df, model_names, self.target, self.predict_func, self.eval_metric, 
-            result_proc=result_proc, train_params=train_params, sp_y=self.sp_y
-        )
-        return train_metrics, valid_metrics, model_result_cv
-    
-    def fit(self, model, model_params, model_names, result_proc=None, train_params={}):
-        """
-        fit the meta model
-        Parameters:
-            model: Class
-                the class of meta model
-            model_params:
-                the parameter of meta model
-            model_names:
-                the names of base model
-            result_proc: function
-                the function to extract the result
-            train_params: dict
-                the parameters for train
-        Returns:
-            dict
-                train result
-        """
-        df = pd.concat([
-                self.model_result[i]['best_result'][0].rename(i) for i in model_names
-            ] + [self.df_train[self.target]], axis=1).sort_index()
-        m, train_result = train_model(model, model_params, df, model_names, self.target, **train_params)
-        train_metric = self.eval_metric(df, self.predict_func(m, df, model_names))
-        if result_proc is not None:
-            train_result = result_proc(m, train_result)
-        self.meta_model = m
-        self.meta_X = model_names
-        return train_result
-    
-    def predict(self, df):
-        """
-        predict with stacking model
-        Parameters:
-            df: pd.DataFrame
-                input dataframe
-        Returns:
-            ndarray
-                result of prediction
-        """
-        prds = list()
-        for m_ in self.meta_X:
-            m, X, _, _ = self.selected_models[m_]
-            prds.append(self.predict_func(m, df, X).rename(m_))
-        return self.meta_model.predict(pd.concat(prds, axis=1))
+def cv(df, sp, hparams, config, adapter, use_gpu = False, **argv):
+    if 'validation_splitter' in config:
+        argv['validation_splitter'] = config.pop('validation_splitter')
 
-    def predict_with_base(self, model_name, df):
-        """
-        predict with a base model
-        Parameters:
-            model_name: str
-                the name of base model
-            df: pd.DataFrame
-                the data to predict 
-        """
-        m, X, _, _ = self.selected_models[model_name]
-        return self.predict_func(m, df, X).rename(model_name)
+    if 'train_data_proc' in config and 'train_data_proc_param' in hparams:
+        config = config.copy()
+        config['train_data_proc'] = partial(config['train_data_proc'], **hparams['train_data_proc_param'])
         
-    def save_model(self, file_name):
-        """
-        save this model
-        Parameters:
-            file_name: str
-                file name
-        """
-        model_contents = {
-            'df_train': self.df_train,
-            'target': self.target,
-            'splitter': self.sp,
-            'predict_func': self.predict_func,
-            'eval_metric': self.eval_metric,
-            'model_result': self.model_result,
-            'selected_models': self.selected_models,
-            'greater_better': self.greater_better,
-            'meta_model': self.meta_model,
-            'meta_X': self.meta_X,
-            'sp_y': self.sp_y
-        }
-        with open(file_name, 'wb') as f:
-            pkl.dump(model_contents, f)
+    ret = cv_model(
+        sp=sp, df=df, **config, **adapter.adapt(hparams, is_train=False, use_gpu = use_gpu, **argv)
+    )
+    ret['hparams'] = hparams
+    return ret
+
+def train(df, hparams, config, adapter, use_gpu = False, **argv):
+    hparam_ = adapter.adapt(hparams, is_train=True, use_gpu = use_gpu, **argv)
+    train_params = hparam_.pop('train_params') if 'train_params' in hparam_ else {}
+    if 'train_data_proc' in config:
+        data_proc = partial(config['train_data_proc'], **hparams.get('train_data_proc_param', {}))
+    else:
+        data_proc = lambda x: x
+    return train_model(df_train=data_proc(df), **hparam_, **config, **train_params), hparam_['X']
+                 
+def save_predictor(path, model_name, adapter, objs, spec):
+    model_filename = os.path.join(path, model_name + '.model')
+    adapter.save_model(model_filename, objs['model'])
+    if 'preprocessor' in objs:
+        pre_filename = os.path.join(path, model_name + '.pre')
+        joblib.dump(objs['preprocessor'], pre_filename)
+    joblib.dump(spec, os.path.join(path, model_name + '.spec'))
     
-    def load_model(file_name):
-        """
-        load the model
-        Parameters:
-            file_name: str
-                file name
-        """
-        with open(file_name, 'rb') as f:
-            model_contents = pkl.load(f)
-        stk = SGStacking(
-            model_contents['df_train'], model_contents['target'],
-            model_contents['splitter'], model_contents['predict_func'], model_contents['eval_metric'], model_contents['greater_better'],
-            sp_y = model_contents['sp_y']
-        )
-        stk.model_result = model_contents['model_result']
-        stk.selected_models = model_contents['selected_models']
-        stk.meta_model = model_contents['meta_model']
-        stk.meta_X = model_contents['meta_X']
-        return stk
+def load_predictor(path, model_name, adapter):
+    model_filename = os.path.join(path, model_name + '.model')
+    if os.path.exists(model_filename):
+        spec = joblib.load(os.path.join(path, model_name + '.spec'))
+        model = adapter.load_model(model_filename)
+        pre_filename = os.path.join(path, model_name + '.pre')
+        if os.path.exists(pre_filename):
+            return {'model': model, 'preprocessor': joblib.load(pre_filename), 'spec': spec}
+        return {'model': model, 'preprocessor': None, 'spec': spec}
+    else:
+        return None
+
+def assemble_predictor(model, config, preprocessor = None, spec = None, **args):
+    if preprocessor is not None:
+        return lambda x: config['predict_func'](make_pipeline(preprocessor, model), x, spec)
+    if config.get('target_invfunc', None) is None:
+        return lambda x: config['predict_func'](model, x, spec)
+    else:
+        return lambda x: config['target_invfunc'](x, config['predict_func'](model, x, spec))
+        
+class BaseAdapter():
+    def save_model(self, filename, model):
+        joblib.dump(model, filename)
+        
+    def load_model(self, filename):
+        return joblib.load(filename)
+
+class SklearnAdapter(BaseAdapter):
+    def __init__(self, model):
+        self.model = model
+
+    def adapt(self, hparams, is_train=False, use_gpu = False, **argv):
+        X, _, transformers = get_transformers(hparams)
+        preprocessor = hparams.get('preprocessor', None)
+        if preprocessor is None:
+            preprocessor = ColumnTransformer(transformers) if not is_empty_transformer(transformers) else None
+        else:
+            X = X + hparams.get('X_pre', [])
+            preprocessor = make_pipeline(preprocessor, ColumnTransformer(transformers)) if not is_empty_transformer(transformers) else preprocessor
+        return {
+            'model': self.model,
+            'model_params': hparams.get('model_params', {}),
+            'X': X,
+            'preprocessor': preprocessor,
+            'result_proc': argv.get('result_proc', None)
+        }
+    def __str__(self):
+        return str(self.model.__name__)
+
+class LGBMAdapter(BaseAdapter):
+    def __init__(self, model, progress = 0):
+        self.model = model
+        self.callbacks = list()
+        if progress > 0:
+            self.callbacks.append(LGBMFitProgressbar(update_cycle = progress))
+
+    def adapt(self, hparams, is_train=False, use_gpu = False, **argv):
+        X, X_cat_feature, transformers = get_cat_transformers_ord(hparams)
+        validation_fraction = hparams.get('validation_fraction', 0)
+        if validation_fraction > 0:
+            if argv.get('validation_splitter', None) is None:
+                validation_splitter = lambda x: train_test_split(x, test_size=validation_fraction, random_state=123)
+            else:
+                validation_splitter = argv.get('validation_splitter')(validation_fraction)
+        else:
+            validation_splitter = None
+        preprocessor = hparams.get('preprocessor', None)
+        if preprocessor is None:
+            preprocessor = ColumnTransformer(transformers) if not is_empty_transformer(transformers) else None
+        else:
+            X = X + hparams.get('X_pre', [])
+            preprocessor = make_pipeline(preprocessor, ColumnTransformer(transformers)) if not is_empty_transformer(transformers) else preprocessor
+        return {
+            'model': self.model, 
+            'model_params': {'verbose': -1, **hparams['model_params']},
+            'X': X,
+            'preprocessor': preprocessor,
+            'train_params': {
+                'fit_params': {
+                    'categorical_feature': X_cat_feature,
+                    'callbacks': self.callbacks
+                },
+                'valid_splitter': validation_splitter,
+                'valid_config_proc': gb_valid_config if validation_fraction > 0 or argv.get('validate_train', False) else None,
+            },
+            'result_proc': argv.get('result_proc', lgb_learning_result),
+        }
+
+class XGBAdapter(BaseAdapter):
+    def __init__(self, model, gpu = 'cuda', progress = 0):
+        self.model = model
+        self.gpu = 'cuda'
+        self.progress = progress
+
+    def adapt(self, hparams, is_train=False, use_gpu = False, **argv):
+        X_cat_feature = []
+        if hparams.get('model_params', {}).get('enable_categorical', False):
+            X, X_cat_feature, transformers = get_cat_transformers_ord(hparams)
+        else:
+            X, _, transformers = get_cat_transformers_ohe(hparams)
+        validation_fraction = hparams.get('validation_fraction', 0)
+        if validation_fraction > 0:
+            if argv.get('validation_splitter', None) is None:
+                validation_splitter = lambda x: train_test_split(x, test_size=validation_fraction, random_state=123)
+            else:
+                validation_splitter = argv.get('validation_splitter')(validation_fraction)
+        else:
+            validation_splitter = None
+        preprocessor = hparams.get('preprocessor', None)
+        if preprocessor is None:
+            preprocessor = ColumnTransformer(transformers) if not is_empty_transformer(transformers) else None
+        else:
+            X = X + hparams.get('X_pre', [])
+            preprocessor = make_pipeline(preprocessor, ColumnTransformer(transformers)) if not is_empty_transformer(transformers) else preprocessor
+        callbacks = list()
+        if self.progress > 0:
+            callbacks.append(
+                XGBFitProgressbar(n_estimators=hparams['model_params'].get('n_estimators', 100), update_cycle = self.progress)
+            )
+        return {
+            'model': self.model, 
+            'model_params': {
+                **hparams.get('model_params', {}), 
+                'callbacks': callbacks,
+                'device': self.gpu if use_gpu else 'cpu'
+            },
+            'X': X,
+            'preprocessor': preprocessor,
+            'train_params': {
+                'valid_splitter': validation_splitter,
+                'valid_config_proc': gb_valid_config if validation_fraction > 0 or argv.get('validate_train', False) else None,
+                'fit_params': {'verbose': False},
+                'categorical_num': len(X_cat_feature)
+            },
+            'result_proc': argv.get('result_proc', xgb_learning_result),
+        }
+
+class CBAdapter(BaseAdapter):
+    def __init__(self, model, gpu = 'GPU', progress = 0):
+        self.model = model
+        self.gpu = gpu
+        self.progress = progress
+
+    def adapt(self, hparams, is_train=False, use_gpu = False, **argv):
+        X, X_cat_feature, transformers = get_cat_transformers_pt(hparams)
+        validation_fraction = hparams.get('validation_fraction', 0)
+        if validation_fraction > 0:
+            if argv.get('validation_splitter', None) is None:
+                validation_splitter = lambda x: train_test_split(x, test_size=validation_fraction, random_state=123)
+            else:
+                validation_splitter = argv.get('validation_splitter')(validation_fraction)
+        else:
+            validation_splitter = None
+
+        preprocessor = hparams.get('preprocessor', None)
+        if preprocessor is None:
+            preprocessor = ColumnTransformer(transformers).set_output(transform='pandas') if not is_empty_transformer(transformers) else None
+        else:
+            X = X + hparams.get('X_pre', [])
+            preprocessor = make_pipeline(preprocessor, ColumnTransformer(transformers).set_output(transform='pandas')) if not is_empty_transformer(transformers) else preprocessor
+        if (not use_gpu) and self.progress > 0:
+            fit_params = {'callbacks': [CatBoostFitProgressbar(n_estimators=hparams['model_params'].get('n_estimators', 100), update_cycle = self.progress)]}
+            valid_config = gb_valid_config
+        else:
+            fit_params = {}
+            valid_config = gb_valid_config_valid_only if validation_fraction > 0 else gb_valid_config
+        return {
+            'model': self.model, 
+            'model_params': {
+                **hparams['model_params'], 
+                'cat_features': X_cat_feature, 'verbose': False,
+                'task_type': self.gpu if use_gpu else None
+            },
+            'X': X,
+            'preprocessor': preprocessor,
+            'train_params': {
+                'valid_splitter': validation_splitter,
+                'valid_config_proc': valid_config if validation_fraction > 0 or argv.get('validate_train', False) else None,
+                'fit_params':  fit_params
+            },
+            'result_proc': argv.get('result_proc', cb_learning_result),
+        }
+
+    def save_model(self, filename, model):
+        model.save_model(filename)
+    
+    def load_model(self, filename):
+        model = self.model()
+        return model.load_model(filename)
