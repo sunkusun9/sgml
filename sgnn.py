@@ -3,28 +3,45 @@ from functools import partial
 import pandas as pd
 import numpy as np
 import gc
+import sgml
+import joblib
 
 import tensorflow  as tf
 from tensorflow.keras.callbacks import Callback
 
 from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin, clone
 from sklearn.metrics import r2_score, accuracy_score
+from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import LabelEncoder
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.model_selection import train_test_split
 
 try:
     from tqdm.notebook import tqdm
 except:
     from tqdm import tqdm
 
+def nn_valid_config(train_set, valid_set):
+    return {}, {'eval_set': valid_set if valid_set is not None else train_set}
+
+def nn_learning_result(train_result):
+    return {
+        'history': pd.DataFrame(train_result['model'].history_),
+        **{k: v for k, v in train_result.items() if k != 'model'}
+    }
+
 def fit_tf_model_to_Y(
     model, X, Y, to_tf_dataset, loss, optimizer, epochs,
     sample_weights = None, transformer = None,
     verbose=0, metrics = None, batch_size=64, shuffle_size=10240000, eval_set=None, validation_splitter=None,
-    cb = [], early_stopping = None, reduce_lr_on_plateau = None, lr_scheduler = None
+    cb = [], early_stopping = None, reduce_lr_on_plateau = None, lr_scheduler = None, target_transformer = None
 ):
     tf.keras.backend.clear_session()
     cb = cb.copy()
+    if target_transformer is not None:
+        target_func = lambda x: target_transformer.transform(x)
+    else:
+        target_func = lambda x: x
     if validation_splitter != None:
         if eval_set is not None:
             raise Exception("If validation_splitter is set, eval_set should not be set.")
@@ -41,13 +58,13 @@ def fit_tf_model_to_Y(
     if lr_scheduler is not None:
         cb.append(tf.keras.callbacks.LearningRateScheduler(**lr_scheduler))
     if transformer is not None:
-        X = transformer.fit_transform(X, Y)
-    ds_train = to_tf_dataset(X, Y, sample_weights)
+        X = transformer.fit_transform(X, target_func(Y))
+    ds_train = to_tf_dataset(X, target_func(Y), sample_weights)
     if eval_set is not None:
         if transformer is not None:
-            ds_eval = to_tf_dataset(transformer.transform(eval_set[0]), eval_set[1], eval_set[2])
+            ds_eval = to_tf_dataset(transformer.transform(eval_set[0]), target_func(eval_set[1]), eval_set[2] if len(eval_set) > 2 else None)
         else:
-            ds_eval = to_tf_dataset(eval_set[0], eval_set[1], eval_set[2] if len(eval_set) > 2 else None)
+            ds_eval = to_tf_dataset(eval_set[0], target_func(eval_set[1]), eval_set[2] if len(eval_set) > 2 else None)
     else:
         ds_eval = None
     if shuffle_size > 0:
@@ -75,7 +92,7 @@ def predict_tf_model(model, X, to_tf_dataset, batch_size=64, **argv):
     prd =  model.predict(ds, verbose=argv.get('verbose', 0))
     del ds
     gc.collect()
-    return prd
+    return np.squeeze(prd)
 
 
 def create_model(inp, o, config, embedding = None, 
@@ -92,7 +109,7 @@ def create_model(inp, o, config, embedding = None,
                 X_inp[k] = tf.keras.Input(dtype=ord_dtype, shape=(v[1], ), name=k)
                 X_cat.append(X_inp[k])
             elif v[0] == 'emb':
-                X_inp[k] =tf.keras.Input(dtype=tf.int32, shape=(v[3], ), name=k)
+                X_inp[k] = tf.keras.Input(dtype=tf.int32, shape=(v[3], ), name=k)
                 if v[4] > 0 and v[5] > 0:
                     kreg = tf.keras.regularizers.L1L2(v[4], v[5])
                 elif v[4] > 0:
@@ -101,8 +118,8 @@ def create_model(inp, o, config, embedding = None,
                     kreg = tf.keras.regularizers.L2(v[5])
                 else:
                     kreg = None
-                X_emb = tf.keras.layers.Embedding(v[1], v[2], embeddings_regularizer = kreg,
-                                                  dtype=cont_dtype, name=k+'_emb')(X_inp[k])
+                X_emb = tf.keras.layers.Embedding(v[1] + 1, v[2], embeddings_regularizer = kreg,
+                                                  dtype=cont_dtype, name=k+'_emb')(X_inp[k] + 1)
                 X_emb = tf.keras.layers.Reshape((v[2] * v[3],), name=k + '_reshape_emb')(X_emb)
                 X_cat.append(X_emb)
         X = tf.keras.layers.Concatenate(axis=-1, name='concat_inputs')(X_cat)
@@ -169,20 +186,21 @@ def get_input(X, ordinal = None, embedding = None, **argv):
         else:
             cont_len = X.shape[-1] - (0 if ordinal is None else ordinal)\
                                     - (0 if embedding is None else np.sum([i[0] for i in embedding]))
-            if cont_len > 0:
-                inp['X_cont'] = ('cont', cont_len)
+            if embedding is not None:
+                f_ = 0
+                for k, v in enumerate(embedding):
+                    inp['X_emb_{}'.format(k)] = ('emb', v[1], v[2], v[0], v[3], v[4])
+                    f_ += v[0]
             if ordinal is None:
                 ordinal = 0
             if ordinal > 0:
                 inp['X_ord'] = ('ord', ordinal)
-            if embedding is not None:
-                f_ = cont_len + ordinal
-                for k, v in enumerate(embedding):
-                    inp['X_emb_{}'.format(k)] = ('emb', v[1], v[2], v[0], v[3], v[4])
-                    f_ += v[0]
+            if cont_len > 0:
+                inp['X_cont'] = ('cont', cont_len)            
     else:
         inp = X.shape[1]
     return inp
+
 def create_dataset(X, y=None, sample_weights=None, ordinal=None, embedding=None):
     output_ = None
     if ordinal is not None or embedding is not None:
@@ -199,17 +217,20 @@ def create_dataset(X, y=None, sample_weights=None, ordinal=None, embedding=None)
         else:
             cont_len = X.shape[-1] - (0 if ordinal is None else ordinal)\
                                     - (0 if embedding is None else np.sum([i[0] for i in embedding]))
-            if cont_len > 0:
-                arr['X_cont'] = X[:, :cont_len]
-            if ordinal is None:
-                ordinal = 0
-            if ordinal > 0:
-                arr['X_ord'] = X[:, cont_len: (cont_len + ordinal)]
+            f_ = 0
             if embedding is not None:
-                f_ = cont_len + ordinal
+                
                 for k, v in enumerate(embedding):
                     arr['X_emb_{}'.format(k)] = X[:, f_:f_+v[0]]
                     f_ += v[0]
+            if ordinal is None:
+                ordinal = 0
+            if ordinal > 0:
+                arr['X_ord'] = X[:, f_: (f_ + ordinal)]
+                f_ += ordinal
+            if cont_len > 0:
+                arr['X_cont'] = X[:, f_:]
+            
         if type(y) == pd.Series:
             if sample_weights is None:
                 return tf.data.Dataset.from_tensor_slices((arr, y.values))
@@ -279,13 +300,15 @@ class FitProgressBar(Callback):
                     self.metric_hist.append(v)
             if self.metric is not None:
                 if self.greater_is_better:
-                    postfix.append(
-                        'Best {}: {}/{}'.format(self.metric, np.argmax(self.metric_hist) + 1, self.fmt.format(np.max(self.metric_hist)))
-                    )
+                    if len(self.metric_hist) > 0:
+                        postfix.append(
+                            'Best {}: {}/{}'.format(self.metric, np.argmax(self.metric_hist) + 1, self.fmt.format(np.max(self.metric_hist)))
+                        )
                 else:
-                    postfix.append(
-                        'Best {}: {}/{}'.format(self.metric, np.argmin(self.metric_hist) + 1, self.fmt.format(np.min(self.metric_hist)))
-                    )
+                    if len(self.metric_hist) > 0:
+                        postfix.append(
+                            'Best {}: {}/{}'.format(self.metric, np.argmin(self.metric_hist) + 1, self.fmt.format(np.min(self.metric_hist)))
+                        )
             self.epoch_progress_bar.set_postfix_str(', '.join(postfix))
     def on_train_end(self, logs = None):
         if self.step_progress_bar is not None:
@@ -462,23 +485,25 @@ class NNEstimator(BaseEstimator):
         self.random_state = random_state
         self.validation_splitter = validation_splitter
         self.model_ = None
+        self.inp_ = None
     
     def fit(self, X, y=None, sample_weights=None, **argv):
+        if self.transformer is not None:
+            self.transformer_ = clone(self.transformer)
+        else:
+            self.transformer_ = None
         if 'refit' not in argv or not argv['refit'] or not self.is_fitted:
             if self.model_ is None:
                 if self.model is None:
+                    self.inp_ = get_input(X, **self.model_params)
                     self.model_ = create_model(
-                        inp = get_input(X, **self.model_params),
+                        inp = self.inp_,
                         proba=self.classes_ is not None, 
                         o=1 if self.classes_ is None or self.is_binary else len(self.classes_),
                         **self.model_params
                     )
                 else:
                     self.model_ = self.model(**self.model_params)
-        if self.transformer is not None:
-            self.transformer_ = clone(self.transformer)
-        else:
-            self.transformer_ = None
         if self.random_state is not None:
             tf.random.set_seed(self.random_state)
         if self.loss_ is None:
@@ -516,19 +541,31 @@ class NNEstimator(BaseEstimator):
     def predict(self, X, **argv):
         if not self.is_fitted_: 
             raise Exception('Not Fitted')
+        if self.transformer_ is not None:
+            X = self.transformer_.transform(X)
         return predict_tf_model(self.model_, X, self.to_tf_dataset, batch_size=self.batch_size, **argv)
+
+    def get_obj(self):
+        return {
+            'transformer': self.transformer_
+        }
+
+    def set_obj(self, o):
+        self.classes_ = None
+        self.is_binary = False
+        self.transformer_ = o['transformer']
 
 class NNClassifier(ClassifierMixin, NNEstimator):
     def fit(self, X, y, **argv):
         self.le_ = LabelEncoder()
-        y_lbl = self.le_.fit_transform(y)
+        self.le_.fit(y)
         self.classes_ = self.le_.classes_
         self.is_binary = len(self.classes_) == 2
         if self.loss is None:
             self.loss_ = tf.keras.losses.BinaryCrossentropy() if self.is_binary else tf.keras.losses.SparseCategoricalCrossentropy()
         else:
             self.loss_ = self.loss
-        return super().fit(X, y_lbl, **argv)
+        return super().fit(X, y, target_transformer=self.le_, **argv)
 
     def predict(self, X, **argv):
         y_prd = super().predict(X, **argv)
@@ -552,19 +589,115 @@ class NNClassifier(ClassifierMixin, NNEstimator):
     def score(self, X, y, sample_weight=None):
         return accuracy_score(y, self.predict(X))
 
+    def get_obj(self):
+        return {
+            'le': self.le_,
+            'classes': self.classes_,
+            **super().get_obj()
+        }
+
+    def set_obj(self, o):
+        super().set_obj(o)
+        self.le_ = o['le']
+        self.classes_ = o['classes']
+        self.is_binary = len(self.classes_) == 2
+
 class NNRegressor(NNEstimator, RegressorMixin):
     def fit(self, X, y, **argv):
         self.classes_ = None
+        self.is_binary = False
         if self.loss is None:
             self.loss_ = tf.keras.losses.MeanSquaredError()
         else:
             self.loss_ = self.loss
         return super().fit(X, y, **argv)
-    
-    def predict(self, X, **argv):
-        ds_, _ = create_dataset(X, ordinal=self.ordinal, 
-                                embedding=self.embedding, batch_size=self.batch_size, shuffle_size=0)
-        return np.squeeze(self.model_.predict(ds_, **argv))
-    
+       
     def score(self, X, y, sample_weight=None):
         return r2_score(y, self.predict(X))
+
+def save_model(filename, model):
+    joblib.dump({
+        "loss": model.loss,
+        "model_params": model.model_params,
+        "to_tf_dataset": model.to_tf_dataset,
+        "random_state": model.random_state,
+        "optimizer": model.optimizer,
+        "epochs": model.epochs,
+        "transformer": model.transformer,
+        "batch_size": model.batch_size,
+        "shuffle_size": model.shuffle_size,
+        "early_stopping": model.early_stopping,
+        "reduce_lr_on_plateau": model.reduce_lr_on_plateau,
+        "lr_scheduler": model.lr_scheduler,
+        "random_state": model.random_state,
+        "validation_splitter": model.validation_splitter,
+        'weights': model.model_.get_weights(),
+        'inp': model.inp_,
+        'obj': model.get_obj()
+    }, filename)
+        
+def load_model(filename, m):
+    d = joblib.load(filename)
+    w = d.pop('weights')
+    o = d.pop('obj')
+    inp = d.pop('inp')
+    model = m(**d)
+    model.set_obj(o)
+    if model.model is None:
+        model.model_ = create_model(
+            inp = inp,
+            proba=model.classes_ is not None, 
+            o=1 if model.classes_ is None or model.is_binary else len(model.classes_),
+            **model.model_params
+        )
+    else:
+        self.model_ = model.model(**self.model_params)
+    
+    model.model_.set_weights(w)
+    model.is_fitted_ = True
+    
+    return model
+
+class NNAdapter(sgml.BaseAdapter):
+    def __init__(self, model, to_tf_dataset=None, target_func=None, progress=50):
+        self.model = model
+        self.to_tf_dataset = to_tf_dataset
+        self.target_func = target_func
+        self.progress = progress
+
+    def adapt(self, hparams, is_train=False, **argv):
+        X, _, transformers = sgml.get_cat_transformers_ord(hparams)
+        validation_fraction = hparams.get('validation_fraction', 0)
+        if validation_fraction > 0:
+            if argv.get('validation_splitter', None) is None:
+                validation_splitter = lambda x: train_test_split(x, test_size=validation_fraction, random_state=123)
+            else:
+                validation_splitter = argv.get('validation_splitter')(validation_fraction)
+        else:
+            validation_splitter = None
+        return {
+            'model': self.model, 
+            'model_params': {
+                **hparams['model_params'], 
+                'to_tf_dataset': self.to_tf_dataset
+            }, 'X': X,
+            'preprocessor': ColumnTransformer(transformers) if len(transformers) > 0 else None,
+            'train_params': {
+                'valid_splitter': validation_splitter,
+                'valid_config_proc': nn_valid_config if validation_fraction > 0 or argv.get('validate_train', False) else None,
+                'fit_params': {
+                    'cb': [FitProgressBar(
+                        metric=argv.get('prog_metric', None), greater_is_better=argv.get('prog_greater_is_better', True), 
+                        postfix_step=self.progress, prog_level=1
+                    )]
+                }
+            },
+            'result_proc': argv.get('result_proc', nn_learning_result),
+            'target_func': argv.get('target_func', self.target_func)
+        }
+      
+    def save_model(self, filename, model):
+        save_model(filename, model)
+    
+    def load_model(self, filename):
+        return load_model(filename, self.model)
